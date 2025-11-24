@@ -1,0 +1,32 @@
+# Core dependencies for MPT-7B-MoE training
+# NOTE: Install PyTorch with CUDA support FIRST using:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# Then install the rest with: pip install -r requirements.txt
+
+# PyTorch with CUDA (using extra index URL)
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Core ML libraries
+transformers>=4.35.0
+accelerate>=0.25.0
+datasets>=2.14.0
+
+# DeepSpeed for MoE and distributed training
+deepspeed>=0.12.0
+
+# Utilities
+tqdm>=4.65.0
+numpy>=1.24.0
+tensorboard>=2.14.0
+
+# Optional but recommended
+scipy>=1.10.0
+sentencepiece>=0.1.99  # For some tokenizers
+protobuf>=3.20.0
+
+# For better performance (optional)
+# nvidia-ml-py3>=7.352.0  # For GPU monitoring
+# wandb>=0.15.0  # Alternative to tensorboard for logging
