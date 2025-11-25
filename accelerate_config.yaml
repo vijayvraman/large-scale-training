@@ -2,7 +2,7 @@ compute_environment: LOCAL_MACHINE
 distributed_type: DEEPSPEED
 deepspeed_config:
   deepspeed_config_file: deepspeed_moe_config.json
-  zero3_init_flag: true
+  zero3_init_flag: false
 downcast_bf16: 'no'
 machine_rank: 0
 main_training_function: main

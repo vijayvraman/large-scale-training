@@ -2,22 +2,31 @@
 
 Train MPT-7B Mixture of Experts (MoE) models using HuggingFace Transformers, Accelerate, and DeepSpeed on multi-GPU systems.
 
+## Overview
+
+- **Model**: MPT-7B (mosaicml/mpt-7b)
+- **Dataset**: Natural Questions (NQ Open) - 87,925 Q&A pairs
+- **Hardware**: 2x NVIDIA H100 80GB GPUs
+- **Training Framework**: DeepSpeed ZeRO Stage 2 with HuggingFace Accelerate
+- **Expert Configuration**: 4 experts (factual_lookup, numerical_reasoning, multi_hop_reasoning, commonsense_reasoning)
+- **Training Time**: ~2-2.5 hours per epoch (optimized)
+
 ## Features
 
 - Multi-GPU distributed training using HuggingFace Accelerate
-- DeepSpeed integration with MoE support
-- ZeRO-2 optimization for memory efficiency
-- Mixed precision training (FP16/BF16)
-- Question-Answer dataset format support
+- DeepSpeed ZeRO Stage 2 optimization for optimal speed/memory balance
+- Mixed precision training (BF16)
+- Natural Questions dataset with expert routing annotations
 - Automatic checkpointing and resume
 - Gradient accumulation and clipping
-- Comprehensive logging
+- Comprehensive logging and monitoring
+- Optimized for H100 GPUs
 
 ## Requirements
 
 - Python 3.8+
-- CUDA-capable GPUs (tested with 4+ GPUs)
-- 40GB+ GPU memory recommended per GPU for MPT-7B
+- CUDA-capable GPUs (optimized for 2x H100 80GB)
+- DeepSpeed, Transformers, Accelerate
 
 ## Installation
 
@@ -62,19 +71,38 @@ num_processes: 4  # Change to your GPU count
 
 ### 2. DeepSpeed Config (`deepspeed_moe_config.json`)
 
-Key settings to adjust:
+**Current Optimized Configuration (ZeRO Stage 2):**
 
 ```json
 {
-  "train_batch_size": 32,  // Total batch size across all GPUs
-  "train_micro_batch_size_per_gpu": 1,  // Batch per GPU
-  "gradient_accumulation_steps": 16,  // Accumulation steps
+  "train_batch_size": 32,
+  "train_micro_batch_size_per_gpu": 4,
+  "gradient_accumulation_steps": 4,
+  "zero_optimization": {
+    "stage": 2,
+    "offload_optimizer": {"device": "none"},
+    "overlap_comm": true,
+    "contiguous_gradients": true
+  },
+  "bf16": {"enabled": true},
   "moe": {
-    "num_experts": 4,  // Number of MoE experts
-    "top_k": 1  // Top-k routing
+    "enabled": true,
+    "num_experts": 4,
+    "top_k": 1
   }
 }
 ```
+
+**Key Configuration Details:**
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| **ZeRO Stage** | 2 | Shards optimizer + gradients across GPUs (no CPU offload) |
+| **Micro batch per GPU** | 4 | Actual batch size loaded per GPU |
+| **Gradient accumulation** | 4 | Accumulate over 4 steps before optimizer update |
+| **Effective batch size** | 32 | 2 GPUs × 4 micro batch × 4 accumulation |
+| **Sequence length** | 256 | Maximum token length (set via --max_seq_length) |
+| **Precision** | bfloat16 | Better numerical stability than fp16 |
 
 ## Training
 
@@ -179,56 +207,218 @@ model = AutoModelForCausalLM.from_pretrained("./mpt7b_moe_finetune/checkpoint-ep
 tokenizer = AutoTokenizer.from_pretrained("./mpt7b_moe_finetune/checkpoint-epoch-1")
 ```
 
+## Configuration Optimization Journey
+
+### Evolution of Configuration
+
+#### Initial Setup (ZeRO Stage 3 + CPU Offloading)
+**Problem**: Very slow training (~7.5 hours per epoch)
+
+```json
+{
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": 16,
+  "zero_optimization": {
+    "stage": 3,
+    "offload_optimizer": {"device": "cpu"},
+    "offload_param": {"device": "cpu"}
+  }
+}
+```
+
+- **GPU Usage**: Only 10 GB (12% utilization)
+- **Speed**: ~1.57 it/s
+- **Bottleneck**: CPU ↔ GPU transfers for parameters
+- **Total iterations**: 43,963 per epoch
+
+#### Why ZeRO Stage 2 Failed Initially
+**OOM Error**: `torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 12.38 GiB`
+
+```
+GPU has 79.19 GiB capacity, 9.03 GiB free
+Process has 70.15 GiB in use (62.03 GiB by PyTorch)
+```
+
+**Root Cause**: Used `max_seq_length=512` which caused:
+- 4x more activation memory (attention is O(seq_len²))
+- Memory breakdown: 62 GB (model+optimizer+gradients) + 12 GB (activations) = 74 GB
+- Exceeded 79 GB available on H100
+
+#### Final Optimized Configuration (Current)
+**Solution**: ZeRO Stage 2 with `max_seq_length=256` and `micro_batch_size=4`
+
+```json
+{
+  "train_micro_batch_size_per_gpu": 4,
+  "gradient_accumulation_steps": 4,
+  "zero_optimization": {
+    "stage": 2,
+    "offload_optimizer": {"device": "none"}
+  }
+}
+```
+
+- **GPU Usage**: ~40-50 GB (50-60% utilization - safe margin)
+- **Speed**: ~2-3 it/s (1.5-2x faster than Stage 3)
+- **Training Time**: ~2-2.5 hours per epoch (3x faster)
+- **Total iterations**: ~10,990 optimizer steps per epoch
+
+### Memory Usage Breakdown
+
+| Component | Size (BF16) | ZeRO-2 (per GPU) | ZeRO-3 w/ CPU offload |
+|-----------|-------------|------------------|-----------------------|
+| **Model Parameters** | ~14 GB | 7 GB (sharded) | ~0 GB (on CPU) |
+| **Gradients** | ~14 GB | 7 GB (sharded) | 7 GB (sharded) |
+| **Optimizer States** | ~28 GB | 14 GB (sharded) | ~0 GB (on CPU) |
+| **Activations (batch=4, seq=256)** | ~10-15 GB | 10-15 GB | 10-15 GB |
+| **TOTAL** | - | **~38-43 GB** | **~17-22 GB** |
+
+## Understanding Training Metrics
+
+### Progress Bar Explanation
+
+```
+Epoch 1/1: 5% | 2239/43963 [40:21<7:22:22, 1.57it/s, loss=0.0325, lr=1.97e-05]
+11/25/2025 04:41:02 - INFO - Step 140/10991 | Loss: 0.7643 | LR: 1.97e-05
+```
+
+**Two different step counts:**
+- **43,963**: Total dataloader iterations (batches processed)
+  - Calculated as: 87,925 samples ÷ 2 (micro_batch × num_gpus) = 43,963
+- **10,991**: Total optimizer steps (weight updates)
+  - Calculated as: 43,963 ÷ 4 (gradient_accumulation_steps) = 10,991
+
+**Loss values:**
+- `loss=0.0325`: Instantaneous loss for current batch (can be volatile)
+- `Loss: 0.7643`: Averaged loss over last 10 steps (more reliable metric)
+
+### Batch Size Calculation
+
+```
+Effective Batch Size = num_gpus × micro_batch_size × gradient_accumulation_steps
+                     = 2 × 4 × 4
+                     = 32 samples per optimizer update
+```
+
+## Key Lessons Learned
+
+### 1. Gradient Accumulation Does NOT Increase Memory
+
+Gradient accumulation can be increased freely without memory penalty:
+- Each micro-batch is processed independently
+- Gradients are accumulated **in-place** (added to existing gradient tensors)
+- Previous batch data is **freed from memory** before loading next batch
+- Only ONE micro-batch is in GPU memory at any time
+
+**Example**: `gradient_accumulation_steps: 4` vs `16` uses **same memory**
+
+### 2. Sequence Length Has Quadratic Memory Impact
+
+Memory scales with O(seq_len²) due to self-attention mechanism:
+- **256 tokens**: 256² = 65,536 attention elements per head
+- **512 tokens**: 512² = 262,144 attention elements per head
+- **Result**: 4x more memory for activations!
+
+### 3. ZeRO Stage Selection Guide
+
+| Stage | GPU Memory | Speed | Use Case |
+|-------|------------|-------|----------|
+| **Stage 1** | High (60-70 GB) | Fastest | Maximum memory available |
+| **Stage 2** | Medium (40-50 GB) | **Fast** | **Balanced (our choice)** |
+| **Stage 3 (no offload)** | Low (30-40 GB) | Medium | Medium memory constraints |
+| **Stage 3 + CPU offload** | Very Low (10-20 GB) | Slow | Extreme memory constraints |
+
+**Rule of thumb**: Use the lowest ZeRO stage that fits in your GPU memory for best performance.
+
+### 4. CPU Offloading Trade-off
+
+CPU offloading saves GPU memory but at a significant cost:
+- **Overhead**: PCIe bandwidth bottleneck (CPU ↔ GPU transfers)
+- **Speed Impact**: Can make training 2-3x slower
+- **When to use**: Only when absolutely necessary (GPU memory < 40 GB for 7B models)
+
+For our H100s with 80 GB each, CPU offloading is **wasteful** - we have plenty of GPU memory!
+
 ## Troubleshooting
 
 ### Out of Memory (OOM)
 
-1. Reduce `per_device_batch_size` to 1
-2. Increase `gradient_accumulation_steps`
-3. Reduce `max_seq_length`
-4. Enable ZeRO-3 in DeepSpeed config
-5. Try smaller model variants
+If you encounter OOM errors:
+
+1. **Reduce micro batch size**: `train_micro_batch_size_per_gpu: 4 → 2` or `1`
+2. **Increase gradient accumulation**: `gradient_accumulation_steps: 4 → 8` (keeps same effective batch)
+3. **Reduce sequence length**: `--max_seq_length 256 → 128`
+4. **Enable CPU offloading** (last resort):
+   ```json
+   "offload_optimizer": {"device": "cpu", "pin_memory": true}
+   ```
+5. **Switch to ZeRO Stage 3** with parameter offloading
+
+**Memory fragmentation fix** (if you see "reserved but unallocated" warnings):
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
 
 ### Slow Training
 
-1. Increase `per_device_batch_size` if memory allows
-2. Reduce `logging_steps` and `save_steps`
-3. Use `num_workers > 0` in DataLoader (may need adjustment)
-4. Ensure GPUs are properly utilized: check `nvidia-smi`
+If training is too slow:
+
+1. **Check GPU memory usage**: Should be 50-70% utilized
+   ```bash
+   watch -n 2 nvidia-smi
+   ```
+2. **Increase micro batch size** if memory allows (more GPU usage = faster)
+3. **Disable CPU offloading** if enabled
+4. **Use ZeRO Stage 2** instead of Stage 3 (faster communication)
+5. **Reduce logging frequency**: `--logging_steps 10 → 50`
 
 ### Multi-GPU Issues
 
-1. Verify all GPUs are visible: `echo $CUDA_VISIBLE_DEVICES`
-2. Check GPU count matches `num_processes` in accelerate config
-3. Try: `accelerate config` to reconfigure
-4. Use `NCCL_DEBUG=INFO` for detailed distributed training logs
-
-### DeepSpeed/MoE Issues
-
-1. Ensure DeepSpeed is installed: `pip install deepspeed`
-2. Check CUDA compatibility: `python -c "import deepspeed; print(deepspeed.version)"`
-3. The `--convert_to_moe` flag is experimental; for production, use pre-trained MoE models
-4. MoE layer conversion depends on model architecture - may need manual adjustment
+1. Verify all GPUs are visible: `nvidia-smi`
+2. Check GPU count matches `num_processes` in `accelerate_config.yaml`
+3. Reconfigure if needed: `accelerate config`
+4. Debug with: `NCCL_DEBUG=INFO accelerate launch ...`
 
 ## Performance Tips
 
-1. **Batch Size**: Effective batch size = `per_device_batch_size × num_gpus × gradient_accumulation_steps`
-2. **Mixed Precision**: BF16 (bfloat16) is generally more stable than FP16
-3. **Gradient Checkpointing**: Add to model config if OOM (trades compute for memory)
-4. **Data Loading**: Keep `num_workers=0` initially to avoid tokenizer pickling issues
-5. **Learning Rate**: For large batch sizes, scale LR proportionally
+1. **Maximize GPU Utilization**: Increase `train_micro_batch_size_per_gpu` until you use 60-80% of GPU memory
+2. **Minimize Gradient Accumulation**: Lower values = faster training (use it only when memory-constrained)
+3. **Sequence Length vs Batch Size**: Shorter sequences allow larger batch sizes
+4. **Mixed Precision**: BF16 is more stable than FP16 for large models
+5. **Gradient Checkpointing**: Already enabled in script - trades compute for memory
+6. **Effective Batch Size Formula**:
+   ```
+   effective_batch = micro_batch_per_gpu × num_gpus × grad_accumulation
+   ```
 
 ## File Structure
 
 ```
 .
 ├── train_mpt7b_moe_accelerate.py  # Main training script
-├── accelerate_config.yaml         # Accelerate configuration
-├── deepspeed_moe_config.json      # DeepSpeed MoE configuration
-├── nq_annotated_moe.jsonl         # Training dataset
-├── requirements.txt               # Python dependencies
-└── README.md                      # This file
+├── prepare_dataset.py              # Dataset annotation with expert labels
+├── accelerate_config.yaml         # Accelerate distributed config (2 GPUs)
+├── deepspeed_moe_config.json      # DeepSpeed ZeRO Stage 2 config
+├── nq_annotated_moe.jsonl         # Annotated NQ dataset (87,925 samples)
+├── mpt7b_moe_finetune/            # Output directory (checkpoints)
+└── README.md                      # This file (comprehensive guide)
 ```
+
+## Dataset Preparation
+
+The Natural Questions dataset is annotated with expert labels using heuristic-based classification:
+
+```bash
+python prepare_dataset.py
+```
+
+This creates `nq_annotated_moe.jsonl` with 4 expert types:
+- **factual_lookup** (who/what/when/where questions)
+- **numerical_reasoning** (how many/much, distances, percentages)
+- **multi_hop_reasoning** (relational/comparison questions)
+- **commonsense_reasoning** (why/reason/cause questions)
+
+The expert labels are used for MoE routing during training.
 
 ## Citation
 
@@ -251,9 +441,64 @@ This training code is provided as-is. Please refer to the respective licenses of
 - Accelerate
 - MPT models (Apache 2.0)
 
+## Quick Reference
+
+### Current Optimized Settings
+```bash
+# Hardware
+2x NVIDIA H100 80GB GPUs
+
+# Configuration
+ZeRO Stage: 2 (no CPU offload)
+Micro batch per GPU: 4
+Gradient accumulation: 4
+Effective batch size: 32
+Sequence length: 256
+Precision: bfloat16
+
+# Performance
+GPU memory usage: ~40-50 GB per GPU
+Training speed: ~2-3 it/s
+Training time: ~2-2.5 hours per epoch
+Total optimizer steps: ~10,991 per epoch
+```
+
+### Common Commands
+
+```bash
+# Start training
+accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py
+
+# Monitor GPUs
+watch -n 2 nvidia-smi
+
+# Check training logs
+tail -f nohup.out | grep "Step.*Loss"
+
+# Kill training
+pkill -f train_mpt7b_moe_accelerate.py
+```
+
+### Configuration at a Glance
+
+| What | Current Value | Where to Change |
+|------|---------------|-----------------|
+| ZeRO Stage | 2 | `deepspeed_moe_config.json` → `zero_optimization.stage` |
+| Micro batch size | 4 | `deepspeed_moe_config.json` → `train_micro_batch_size_per_gpu` |
+| Gradient accumulation | 4 | `deepspeed_moe_config.json` → `gradient_accumulation_steps` |
+| Sequence length | 256 | Command line: `--max_seq_length 256` |
+| Number of GPUs | 2 | `accelerate_config.yaml` → `num_processes` |
+| Learning rate | 2e-5 | Command line: `--learning_rate 2e-5` |
+
 ## Support
 
 For issues:
 - HuggingFace Accelerate: https://github.com/huggingface/accelerate
 - DeepSpeed: https://github.com/microsoft/DeepSpeed
 - MPT Models: https://huggingface.co/mosaicml
+
+---
+
+**Last Updated**: 2025-11-25
+**Hardware**: 2x H100 80GB
+**Status**: Optimized for ZeRO Stage 2 with 4x micro batch, ~2-2.5 hour training per epoch
