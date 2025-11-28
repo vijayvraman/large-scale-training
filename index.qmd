@@ -1,0 +1,24 @@
+---
+title: "Large-Scale Training Blog"
+listing:
+  contents: posts
+  sort: "date desc"
+  type: default
+  categories: true
+  sort-ui: false
+  filter-ui: false
+page-layout: full
+title-block-banner: true
+---
+
+Welcome to the Large-Scale Training Blog! Here we share insights, techniques, and practical guides for training large language models at scale.
+
+## Latest Posts
+
+This blog covers/will cover topics including:
+
+- Distributed training with DeepSpeed, FSDP, Accelerate, TorchTitan
+- DuCTaPE (5D) Parallelism: Sharded Data, Context, Tensor, Pipeline, Expert
+- GPU optimization with compute speedups and memory management
+- Training infrastructure and best practices
+

@@ -1,0 +1,43 @@
+---
+title: "About"
+---
+
+## Vijay Venkatraman
+
+I'm an experienced AI leader specializing in Generative AI, currently working at DocuSign in the San Francisco Bay Area. My expertise spans across Search, Q&A, NLP, and Large Language Models (LLMs).
+
+### Professional Background
+
+With a strong background in AI leadership and technology innovation, I focus on:
+
+- **Generative AI**: Building and scaling generative AI systems and applications
+- **Large Language Models**: Training, fine-tuning, and deploying LLMs at scale
+- **Search & NLP**: Developing advanced search and natural language processing solutions
+- **AI Product Strategy**: Leading AI teams and driving product innovation
+
+### Education
+
+- **University of California, Davis** - Graduate School of Management
+- **University of Arizona, Tucson** - M.S. in Computer Science
+
+### Current Work
+
+At DocuSign, I lead AI initiatives in Globalization, Agreement Creation, eSign QnA, NL Search and Agentic Workflows
+
+### Connect
+
+- [LinkedIn](https://www.linkedin.com/in/vijayvraman)
+- [GitHub](https://github.com/vijayvraman)
+
+---
+
+## Acknowledgments
+
+This work builds upon excellent tools and frameworks:
+
+- [HuggingFace Transformers](https://github.com/huggingface/transformers)
+- [HuggingFace Accelerate](https://github.com/huggingface/accelerate)
+- [Microsoft DeepSpeed](https://github.com/microsoft/DeepSpeed)
+- [MosaicML MPT Models](https://huggingface.co/mosaicml)
+- [PyTorch FSDP](https://pytorch.org/docs/stable/fsdp.html)
+- [TorchTitan](https://github.com/pytorch/torchtitan)
