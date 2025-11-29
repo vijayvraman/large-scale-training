@@ -51,6 +51,13 @@ python -c "import accelerate; print(f'Accelerate: {accelerate.__version__}')"
 
 ## Dataset Format
 
+We'll focus on the 4 reasoning-style experts:
+
+- **Causal / Explanatory**: why, how, explain, cause
+- **Comparative / Superlative**: largest, taller, vs, more than
+- **Multi-hop**: multiple entities, conjunctions (and, or, between)
+- **Direct Lookup**: everything else
+
 The training script expects a JSONL file where each line contains:
 
 ```json
@@ -61,7 +68,9 @@ Example (`nq_annotated_moe.jsonl`):
 
 ```json
 {"question": "where did they film hot tub time machine", "answer": ["Fernie Alpine Resort"], "expert_label": "factual_lookup"}
-{"question": "who has the right of way in international waters", "answer": ["Neither vessel"], "expert_label": "factual_lookup"}
+{"question": "how many episodes in season 4 of the flash", "answer": ["23"], "expert_label": "numerical_reasoning"}
+{"question": "who has won more grammy awards kelly or carrie", "answer": ["Carrie Underwood"], "expert_label": "multi_hop_reasoning"}
+{"question": "why do we have daylight saving time in the us", "answer": ["to save energy"], "expert_label": "commonsense_reasoning"}
 ```
 
 The `answer` field can be:
