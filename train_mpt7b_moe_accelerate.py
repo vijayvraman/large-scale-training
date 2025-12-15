@@ -607,6 +607,10 @@ def flash_attn_func(*args, **kwargs):
     logger.info(f"Total optimization steps: {total_training_steps}")
     logger.info("=" * 50)
 
+    # Initialize TensorBoard tracker
+    accelerator.init_trackers(project_name="mpt7b_moe_training")
+    logger.info(f"TensorBoard logging initialized. Logs will be written to: {args.output_dir}")
+
     # Training loop
     logger.info("Starting training...")
     global_step = 0
@@ -650,6 +654,15 @@ def flash_attn_func(*args, **kwargs):
                 # Logging
                 if global_step % args.logging_steps == 0:
                     avg_loss = total_loss / args.logging_steps
+
+                    # Log metrics to TensorBoard
+                    accelerator.log({
+                        "train/loss": avg_loss,
+                        "train/learning_rate": lr_scheduler.get_last_lr()[0],
+                        "train/epoch": epoch,
+                        "train/global_step": global_step,
+                    }, step=global_step)
+
                     logger.info(
                         f"Step {global_step}/{total_training_steps} | "
                         f"Loss: {avg_loss:.4f} | "
@@ -677,6 +690,13 @@ def flash_attn_func(*args, **kwargs):
 
         # End of epoch
         avg_epoch_loss = epoch_loss / len(train_dataloader)
+
+        # Log epoch metrics to TensorBoard
+        accelerator.log({
+            "train/epoch_loss": avg_epoch_loss,
+            "train/epoch": epoch + 1,
+        }, step=global_step)
+
         logger.info(f"Epoch {epoch + 1} completed | Average loss: {avg_epoch_loss:.4f}")
 
         # Save end-of-epoch checkpoint
@@ -691,6 +711,10 @@ def flash_attn_func(*args, **kwargs):
 
     logger.info("Training completed!")
     logger.info(f"Final model saved to {args.output_dir}")
+
+    # Close TensorBoard tracker
+    accelerator.end_training()
+    logger.info("TensorBoard logging closed")
 
 
 def save_checkpoint(

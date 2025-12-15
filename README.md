@@ -181,9 +181,45 @@ accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerat
 
 ### TensorBoard
 
+The training script automatically logs metrics to TensorBoard for real-time monitoring and analysis.
+
+#### Logged Metrics
+
+The following metrics are tracked during training:
+
+**Step-level metrics** (logged every `--logging_steps`, default: 10):
+- `train/loss`: Average training loss over the logging interval
+- `train/learning_rate`: Current learning rate from the scheduler
+- `train/epoch`: Current epoch number
+- `train/global_step`: Global training step count
+
+**Epoch-level metrics** (logged at the end of each epoch):
+- `train/epoch_loss`: Average loss across the entire epoch
+- `train/epoch`: Completed epoch number
+
+#### Viewing Logs
+
+TensorBoard logs are saved to `{output_dir}/mpt7b_moe_training/`. To launch TensorBoard:
+
 ```bash
+# Default output directory
 tensorboard --logdir ./mpt7b_moe_finetune
+
+# Custom output directory
+tensorboard --logdir ./mpt7b_moe_checkpoints
+
+# Specify port
+tensorboard --logdir ./mpt7b_moe_finetune --port 6006
 ```
+
+Then open your browser to `http://localhost:6006` to view the training metrics.
+
+#### What to Look For
+
+- **Loss curve**: Should gradually decrease over time
+- **Learning rate**: Should follow warmup → linear decay schedule
+- **Loss spikes**: Occasional spikes are normal, but persistent increases indicate issues
+- **Plateau**: If loss stops decreasing, consider adjusting learning rate or checking data quality
 
 ### GPU Monitoring
 
