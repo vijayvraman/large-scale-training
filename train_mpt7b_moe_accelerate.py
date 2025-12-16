@@ -748,7 +748,8 @@ def flash_attn_func(*args, **kwargs):
                         tokenizer=tokenizer,
                         output_dir=args.output_dir,
                         step=global_step,
-                        epoch=epoch,
+                        epoch=None,  # Use step-based naming
+                        current_epoch=epoch,  # But save current epoch in metadata
                         args=args,
                     )
 
@@ -805,16 +806,25 @@ def save_checkpoint(
     output_dir: str,
     step: int = None,
     epoch: int = None,
+    current_epoch: int = None,
     args=None,
 ):
-    """Save complete training checkpoint including model, optimizer, scheduler, and RNG states."""
+    """Save complete training checkpoint including model, optimizer, scheduler, and RNG states.
+
+    Args:
+        step: Global step number
+        epoch: If provided, uses epoch-based naming (checkpoint-epoch-{epoch})
+        current_epoch: The current epoch number to save in metadata (can differ from epoch param)
+    """
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
         if epoch is not None:
             save_dir = os.path.join(output_dir, f"checkpoint-epoch-{epoch}")
+            epoch_to_save = epoch  # For epoch checkpoints, use epoch value
         else:
             save_dir = os.path.join(output_dir, f"checkpoint-step-{step}")
+            epoch_to_save = current_epoch if current_epoch is not None else 0  # For step checkpoints, use current_epoch
 
         os.makedirs(save_dir, exist_ok=True)
 
@@ -856,8 +866,8 @@ def save_checkpoint(
         # Save training metadata
         metadata = {
             "global_step": step,
-            "epoch": epoch if epoch is not None else -1,
-            "completed_epoch": epoch if epoch is not None else -1,
+            "epoch": epoch_to_save,
+            "completed_epoch": epoch if epoch is not None else -1,  # Only completed if this is an epoch checkpoint
         }
         if args is not None:
             metadata["args"] = vars(args)
