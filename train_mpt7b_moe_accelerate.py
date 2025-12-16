@@ -502,7 +502,7 @@ def flash_attn_func(*args, **kwargs):
 
     # Pre-emptively try to patch any existing cached files
     # DISABLED: transformers 4.47.0 should be compatible
-    # patch_mpt_model_files()
+    patch_mpt_model_files()
 
     # First, load and modify the config to use torch attention instead of flash attention
     # This avoids triton_pre_mlir dependency issues

@@ -1,6 +1,6 @@
 # Uncomment as needed and source this file
 
-#nohup env PYTHONUNBUFFERED=1 accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py 2>&1 | TZ=America/Los_Angeles ts '[%Y-%m-%d %H:%M:%S %Z]' > nohup.out &
+nohup env PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py 2>&1 | TZ=America/Los_Angeles ts '[%Y-%m-%d %H:%M:%S %Z]' > nohup.out &
 
 # Replace checkpoint number with epoch
 #python upload_to_hub.py       --model_path ./mpt7b_moe_finetune/checkpoint-step-10500       --repo_name vvijayk/mpt-7b-moe-nq-finetuned
