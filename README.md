@@ -17,7 +17,9 @@ Train MPT-7B Mixture of Experts (MoE) models using HuggingFace Transformers, Acc
 - DeepSpeed ZeRO Stage 2 optimization for optimal speed/memory balance
 - Mixed precision training (BF16)
 - Natural Questions dataset with expert routing annotations
-- Automatic checkpointing and resume
+- **Mid-epoch resumable training** with complete state preservation
+- Deterministic data loading for reproducible training
+- Automatic checkpointing with optimizer and scheduler state
 - Gradient accumulation and clipping
 - Comprehensive logging and monitoring
 - Optimized for H100 GPUs
@@ -136,6 +138,23 @@ accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerat
     --save_steps 500
 ```
 
+### Resuming Training from Checkpoint
+
+```bash
+# Resume from any checkpoint (mid-epoch or end-of-epoch)
+accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py \
+    --resume_from_checkpoint ./mpt7b_moe_checkpoints/checkpoint-step-500 \
+    --model_id mosaicml/mpt-7b \
+    --data_file nq_annotated_moe.jsonl \
+    --output_dir ./mpt7b_moe_checkpoints
+```
+
+**Note**: The training will automatically:
+- Restore model, optimizer, and scheduler states
+- Skip already-processed batches if resuming mid-epoch
+- Continue with the same learning rate schedule
+- Maintain reproducible data ordering
+
 ### All Available Arguments
 
 ```bash
@@ -161,6 +180,7 @@ accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerat
 --output_dir                  Output directory (default: ./mpt7b_moe_finetune)
 --logging_steps               Log every N steps (default: 10)
 --save_steps                  Save every N steps (default: 500)
+--resume_from_checkpoint      Path to checkpoint directory to resume from (default: None)
 
 # Reproducibility
 --seed                        Random seed (default: 42)
@@ -230,19 +250,52 @@ watch -n 1 nvidia-smi
 
 ## Checkpoints
 
-Checkpoints are saved to `{output_dir}/checkpoint-{step|epoch}-{N}/`:
+### Checkpoint Structure
+
+Checkpoints now include complete training state for mid-epoch resumption:
 
 ```
 mpt7b_moe_finetune/
 ├── checkpoint-step-500/
-│   ├── config.json
-│   ├── model.safetensors
+│   ├── config.json              # Model configuration
+│   ├── model.safetensors        # Model weights
+│   ├── optimizer.pt             # Optimizer state (Adam moments, etc.)
+│   ├── scheduler.pt             # Learning rate scheduler state
+│   ├── rng_state.pt             # Random number generator states
+│   ├── training_state.json      # Training metadata (step, epoch, args)
 │   └── tokenizer files...
 ├── checkpoint-epoch-1/
 │   └── ...
 ```
 
-### Loading Checkpoints
+### Resumable Training
+
+Training can now be resumed from any checkpoint, including mid-epoch checkpoints:
+
+```bash
+# Resume from a specific checkpoint
+accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py \
+  --resume_from_checkpoint ./mpt7b_moe_finetune/checkpoint-step-500 \
+  --model_id mosaicml/mpt-7b \
+  --data_file nq_annotated_moe.jsonl \
+  --output_dir ./mpt7b_moe_finetune
+```
+
+**Key Features:**
+- **Mid-Epoch Resumption**: Resume training from any saved step, not just epoch boundaries
+- **Deterministic Shuffling**: Uses epoch-based seeding to ensure reproducible data ordering
+- **Complete State**: Restores optimizer state, learning rate scheduler, RNG states, and training progress
+- **Automatic Skip**: Automatically skips already-processed batches when resuming mid-epoch
+
+**What Gets Restored:**
+- Model weights
+- Optimizer state (momentum, adaptive learning rates)
+- Learning rate scheduler state (warmup progress, step count)
+- Training counters (global step, epoch)
+- Random states (PyTorch, NumPy, Python) for reproducibility
+- Data loading position within the epoch
+
+### Loading Checkpoints for Inference
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -250,6 +303,165 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 model = AutoModelForCausalLM.from_pretrained("./mpt7b_moe_finetune/checkpoint-epoch-1")
 tokenizer = AutoTokenizer.from_pretrained("./mpt7b_moe_finetune/checkpoint-epoch-1")
 ```
+
+## Mid-Epoch Resumable Training
+
+### Overview
+
+The training script now supports complete mid-epoch resumption, allowing you to stop and restart training at any point without losing progress. This is crucial for:
+- Long-running training jobs that may be interrupted
+- Spot instance/preemptible VM usage for cost savings
+- Handling hardware failures or maintenance windows
+- Debugging and iterative development
+
+### Implementation Details
+
+#### 1. **Enhanced Checkpoint Saving** (`train_mpt7b_moe_accelerate.py:728-799`)
+
+Every checkpoint now includes complete training state:
+
+| Component | File | Description |
+|-----------|------|-------------|
+| Model weights | `model.safetensors` | Complete model parameters |
+| Optimizer state | `optimizer.pt` | Adam momentum, adaptive learning rates |
+| Scheduler state | `scheduler.pt` | Warmup progress, current step |
+| RNG states | `rng_state.pt` | Python, NumPy, PyTorch, CUDA random states |
+| Training metadata | `training_state.json` | Global step, epoch, training arguments |
+| Tokenizer | `tokenizer.json`, etc. | Tokenizer configuration and vocabulary |
+
+#### 2. **Checkpoint Loading** (`train_mpt7b_moe_accelerate.py:802-882`)
+
+The `load_checkpoint` function restores all saved state:
+- Automatically detects model file format (safetensors or bin)
+- Loads optimizer and scheduler states onto correct devices
+- Restores all random number generator states for reproducibility
+- Returns global step and epoch information for resume logic
+
+#### 3. **Deterministic Data Loading** (`train_mpt7b_moe_accelerate.py:279-297`)
+
+Uses epoch-based seeding to ensure reproducible data ordering:
+```python
+def get_dataloader_with_epoch_seed(dataset, batch_size, collate_fn, seed, epoch):
+    generator = torch.Generator()
+    generator.manual_seed(seed + epoch)
+    return DataLoader(dataset, shuffle=True, generator=generator, ...)
+```
+
+This ensures that:
+- Each epoch has a deterministic shuffle order
+- Resuming from epoch N will see the same data order as the original run
+- Different epochs have different shuffle orders (seed + epoch)
+
+#### 4. **Smart Batch Skipping** (`train_mpt7b_moe_accelerate.py:680-696`)
+
+When resuming mid-epoch:
+```python
+batches_to_skip = steps_in_current_epoch * gradient_accumulation_steps
+for step, batch in enumerate(dataloader):
+    if step < batches_to_skip:
+        continue  # Fast iteration, no computation
+    # ... training logic
+```
+
+- Calculates exact number of batches to skip
+- Uses fast iteration (no forward/backward passes)
+- Minimal overhead even when skipping thousands of batches
+
+### Usage Examples
+
+#### Starting Fresh Training
+
+```bash
+accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py \
+  --model_id mosaicml/mpt-7b \
+  --data_file nq_annotated_moe.jsonl \
+  --output_dir ./mpt7b_moe_finetune \
+  --epochs 3 \
+  --learning_rate 2e-5 \
+  --save_steps 500
+```
+
+This will save checkpoints:
+- Every 500 steps: `checkpoint-step-500`, `checkpoint-step-1000`, etc.
+- After each epoch: `checkpoint-epoch-1`, `checkpoint-epoch-2`, etc.
+
+#### Resuming from Mid-Epoch Checkpoint
+
+```bash
+accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py \
+  --resume_from_checkpoint ./mpt7b_moe_finetune/checkpoint-step-500 \
+  --model_id mosaicml/mpt-7b \
+  --data_file nq_annotated_moe.jsonl \
+  --output_dir ./mpt7b_moe_finetune
+```
+
+**Note**: When resuming, you still need to specify `--model_id` and `--data_file` for initialization, but the actual model weights and training state come from the checkpoint.
+
+#### Resuming from End-of-Epoch Checkpoint
+
+```bash
+accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py \
+  --resume_from_checkpoint ./mpt7b_moe_finetune/checkpoint-epoch-1 \
+  --model_id mosaicml/mpt-7b \
+  --data_file nq_annotated_moe.jsonl \
+  --output_dir ./mpt7b_moe_finetune
+```
+
+### What Happens During Resume
+
+1. **Checkpoint Detection**: Script detects `--resume_from_checkpoint` argument
+2. **State Restoration**: Loads all saved state (model, optimizer, scheduler, RNG states)
+3. **Position Calculation**: Determines starting epoch and steps within current epoch
+4. **Dataloader Recreation**: Creates dataloader with same epoch seed for reproducible shuffling
+5. **Batch Skipping**: Fast-forwards through already-processed batches
+6. **Seamless Continuation**: Training continues exactly where it left off
+
+### Example Output When Resuming
+
+```
+Loading checkpoint from ./mpt7b_moe_finetune/checkpoint-step-500
+Resuming from global_step=500, epoch=0
+Model weights loaded successfully
+Optimizer state loaded successfully
+Scheduler state loaded successfully
+RNG states restored successfully
+Checkpoint loaded successfully
+
+Starting epoch: 0
+Starting global_step: 500
+Resuming mid-epoch: skipping 4000 batches
+
+Step 510/10000 | Loss: 2.1234 | LR: 1.98e-05
+...
+```
+
+### Key Features
+
+✅ **True Mid-Epoch Resumption**: Resume from any checkpoint, not just epoch boundaries
+✅ **Deterministic & Reproducible**: Same data ordering and random states ensure identical results
+✅ **Efficient Batch Skipping**: Fast iteration through processed batches (no computation)
+✅ **Complete State Preservation**: Optimizer momentum, learning rate schedule, everything restored
+✅ **Distributed Training Compatible**: Works seamlessly with Accelerate and DeepSpeed
+✅ **Automatic Handling**: No manual configuration needed, just pass `--resume_from_checkpoint`
+
+### Limitations and Considerations
+
+1. **Checkpoint Size**: Checkpoints are larger (~2x model size) due to optimizer state
+2. **Data File Requirement**: Must use the same dataset file when resuming
+3. **Seed Dependency**: Changing `--seed` will result in different data ordering
+4. **Gradient Accumulation**: Batch skipping accounts for gradient accumulation steps
+5. **Multi-GPU Consistency**: Ensure same number of GPUs when resuming for best results
+
+### Troubleshooting
+
+**Issue**: "Training state file not found"
+**Solution**: Checkpoint might be from old version. Use a newly saved checkpoint.
+
+**Issue**: Loss jumps after resuming
+**Solution**: Ensure you're using the same dataset and seed. Check that RNG states loaded successfully.
+
+**Issue**: Slow resume when skipping many batches
+**Solution**: This is expected. Skipping is fast (no computation) but iterating through DataLoader takes some time. Consider using more frequent checkpoints if this is a concern.
 
 ## Configuration Optimization Journey
 

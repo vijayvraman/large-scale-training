@@ -26,6 +26,8 @@ import json
 import argparse
 import logging
 import time
+import random
+import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional
 from datasets import load_dataset, Dataset
@@ -157,6 +159,12 @@ def parse_args():
         action="store_true",
         help="Attempt to convert model FFN layers to MoE (experimental)"
     )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint directory to resume training from"
+    )
     return parser.parse_args()
 
 # ---------------------------
@@ -266,6 +274,27 @@ def collate_fn(batch):
         "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
         "labels": torch.stack([b["labels"] for b in batch]),
     }
+
+
+def get_dataloader_with_epoch_seed(dataset, batch_size, collate_fn, seed, epoch):
+    """
+    Create a DataLoader with deterministic shuffling based on epoch seed.
+    This allows reproducible data ordering when resuming training.
+    """
+    # Create a generator with epoch-specific seed
+    generator = torch.Generator()
+    generator.manual_seed(seed + epoch)
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,
+        generator=generator,
+    )
+
+    return dataloader
 
 # ---------------------------
 # Replace FFN with DeepSpeed MoE layers (optional, experimental)
@@ -562,15 +591,6 @@ def flash_attn_func(*args, **kwargs):
     )
     logger.info(f"Created dataset with {len(train_dataset)} examples")
 
-    # Create dataloader
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.per_device_batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=0,  # Set to 0 to avoid multiprocessing issues with tokenizer
-    )
-
     # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -581,8 +601,10 @@ def flash_attn_func(*args, **kwargs):
     )
 
     # Calculate total training steps
+    # Note: We'll create the dataloader per epoch with deterministic seeding
+    num_batches_per_epoch = math.ceil(len(train_dataset) / args.per_device_batch_size)
     num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps
+        num_batches_per_epoch / args.gradient_accumulation_steps
     )
     total_training_steps = args.epochs * num_update_steps_per_epoch
 
@@ -593,14 +615,38 @@ def flash_attn_func(*args, **kwargs):
         num_training_steps=total_training_steps,
     )
 
-    # Prepare everything with accelerator
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
+    # Prepare model, optimizer, and scheduler with accelerator
+    # Note: We'll prepare the dataloader per epoch to allow epoch-based seeding
+    model, optimizer, lr_scheduler = accelerator.prepare(
+        model, optimizer, lr_scheduler
     )
+
+    # Initialize training state
+    starting_epoch = 0
+    global_step = 0
+    steps_in_current_epoch = 0
+
+    # Load checkpoint if resuming
+    if args.resume_from_checkpoint:
+        logger.info(f"Resuming training from checkpoint: {args.resume_from_checkpoint}")
+        loaded_global_step, loaded_epoch = load_checkpoint(
+            checkpoint_dir=args.resume_from_checkpoint,
+            accelerator=accelerator,
+            model=model,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+        )
+        global_step = loaded_global_step
+        starting_epoch = loaded_epoch
+        # Calculate how many steps were completed in the current epoch
+        steps_in_current_epoch = global_step - (starting_epoch * num_update_steps_per_epoch)
+        logger.info(f"Resuming from epoch {starting_epoch}, global_step {global_step}, steps_in_current_epoch {steps_in_current_epoch}")
 
     logger.info("=" * 50)
     logger.info(f"Total examples: {len(train_dataset)}")
     logger.info(f"Epochs: {args.epochs}")
+    logger.info(f"Starting epoch: {starting_epoch}")
+    logger.info(f"Starting global_step: {global_step}")
     logger.info(f"Batch size per device: {args.per_device_batch_size}")
     logger.info(f"Total batch size (with parallel & accumulation): {args.per_device_batch_size * accelerator.num_processes * args.gradient_accumulation_steps}")
     logger.info(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
@@ -613,12 +659,30 @@ def flash_attn_func(*args, **kwargs):
 
     # Training loop
     logger.info("Starting training...")
-    global_step = 0
     total_loss = 0.0
 
-    for epoch in range(args.epochs):
+    for epoch in range(starting_epoch, args.epochs):
         model.train()
         epoch_loss = 0.0
+
+        # Create dataloader with deterministic epoch-based seeding
+        train_dataloader = get_dataloader_with_epoch_seed(
+            dataset=train_dataset,
+            batch_size=args.per_device_batch_size,
+            collate_fn=collate_fn,
+            seed=args.seed,
+            epoch=epoch,
+        )
+
+        # Prepare dataloader with accelerator
+        train_dataloader = accelerator.prepare(train_dataloader)
+
+        # Calculate number of batches to skip if resuming mid-epoch
+        batches_to_skip = 0
+        if epoch == starting_epoch and steps_in_current_epoch > 0:
+            # We need to skip batches we've already processed
+            batches_to_skip = steps_in_current_epoch * args.gradient_accumulation_steps
+            logger.info(f"Resuming mid-epoch: skipping {batches_to_skip} batches")
 
         progress_bar = tqdm(
             train_dataloader,
@@ -627,6 +691,10 @@ def flash_attn_func(*args, **kwargs):
         )
 
         for step, batch in enumerate(progress_bar):
+            # Skip already-processed batches when resuming
+            if step < batches_to_skip:
+                continue
+
             with accelerator.accumulate(model):
                 # Forward pass (no need to move to device, accelerator handles it)
                 outputs = model(**batch)
@@ -675,9 +743,13 @@ def flash_attn_func(*args, **kwargs):
                     save_checkpoint(
                         accelerator=accelerator,
                         model=model,
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler,
                         tokenizer=tokenizer,
                         output_dir=args.output_dir,
                         step=global_step,
+                        epoch=epoch,
+                        args=args,
                     )
 
                 # Update progress bar
@@ -688,8 +760,12 @@ def flash_attn_func(*args, **kwargs):
                     }
                 )
 
+        # Reset steps_in_current_epoch after completing the first epoch
+        if epoch == starting_epoch:
+            steps_in_current_epoch = 0
+
         # End of epoch
-        avg_epoch_loss = epoch_loss / len(train_dataloader)
+        avg_epoch_loss = epoch_loss / (len(train_dataloader) - batches_to_skip)
 
         # Log epoch metrics to TensorBoard
         accelerator.log({
@@ -703,10 +779,13 @@ def flash_attn_func(*args, **kwargs):
         save_checkpoint(
             accelerator=accelerator,
             model=model,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
             tokenizer=tokenizer,
             output_dir=args.output_dir,
             step=global_step,
             epoch=epoch + 1,
+            args=args,
         )
 
     logger.info("Training completed!")
@@ -720,12 +799,15 @@ def flash_attn_func(*args, **kwargs):
 def save_checkpoint(
     accelerator: Accelerator,
     model,
+    optimizer,
+    lr_scheduler,
     tokenizer,
     output_dir: str,
     step: int = None,
     epoch: int = None,
+    args=None,
 ):
-    """Save model checkpoint."""
+    """Save complete training checkpoint including model, optimizer, scheduler, and RNG states."""
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
@@ -750,7 +832,125 @@ def save_checkpoint(
         # Save tokenizer
         tokenizer.save_pretrained(save_dir)
 
+        # Save optimizer state
+        optimizer_path = os.path.join(save_dir, "optimizer.pt")
+        accelerator.save(optimizer.state_dict(), optimizer_path)
+        logger.info(f"Saved optimizer state to {optimizer_path}")
+
+        # Save scheduler state
+        scheduler_path = os.path.join(save_dir, "scheduler.pt")
+        accelerator.save(lr_scheduler.state_dict(), scheduler_path)
+        logger.info(f"Saved scheduler state to {scheduler_path}")
+
+        # Save RNG states
+        rng_path = os.path.join(save_dir, "rng_state.pt")
+        rng_state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+        accelerator.save(rng_state, rng_path)
+        logger.info(f"Saved RNG states to {rng_path}")
+
+        # Save training metadata
+        metadata = {
+            "global_step": step,
+            "epoch": epoch if epoch is not None else -1,
+            "completed_epoch": epoch if epoch is not None else -1,
+        }
+        if args is not None:
+            metadata["args"] = vars(args)
+
+        metadata_path = os.path.join(save_dir, "training_state.json")
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        logger.info(f"Saved training metadata to {metadata_path}")
+
         logger.info(f"Checkpoint saved successfully to {save_dir}")
+
+
+def load_checkpoint(
+    checkpoint_dir: str,
+    accelerator: Accelerator,
+    model,
+    optimizer,
+    lr_scheduler,
+):
+    """Load complete training checkpoint including model, optimizer, scheduler, and RNG states."""
+    logger.info(f"Loading checkpoint from {checkpoint_dir}")
+
+    if not os.path.exists(checkpoint_dir):
+        raise ValueError(f"Checkpoint directory does not exist: {checkpoint_dir}")
+
+    # Load training metadata
+    metadata_path = os.path.join(checkpoint_dir, "training_state.json")
+    if not os.path.exists(metadata_path):
+        raise ValueError(f"Training state file not found: {metadata_path}")
+
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+
+    global_step = metadata.get("global_step", 0)
+    epoch = metadata.get("epoch", 0)
+
+    logger.info(f"Resuming from global_step={global_step}, epoch={epoch}")
+
+    # Load model weights
+    logger.info("Loading model weights...")
+    unwrapped_model = accelerator.unwrap_model(model)
+
+    # Find the model file (could be safetensors or bin)
+    model_files = ["model.safetensors", "pytorch_model.bin"]
+    model_file = None
+    for mf in model_files:
+        mf_path = os.path.join(checkpoint_dir, mf)
+        if os.path.exists(mf_path):
+            model_file = mf
+            break
+
+    if model_file is None:
+        raise ValueError(f"No model file found in {checkpoint_dir}")
+
+    # Load state dict
+    state_dict = torch.load(os.path.join(checkpoint_dir, model_file), map_location="cpu")
+    unwrapped_model.load_state_dict(state_dict, strict=False)
+    logger.info("Model weights loaded successfully")
+
+    # Load optimizer state
+    optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
+    if os.path.exists(optimizer_path):
+        optimizer_state = torch.load(optimizer_path, map_location="cpu")
+        optimizer.load_state_dict(optimizer_state)
+        logger.info("Optimizer state loaded successfully")
+    else:
+        logger.warning(f"Optimizer state not found at {optimizer_path}, starting with fresh optimizer")
+
+    # Load scheduler state
+    scheduler_path = os.path.join(checkpoint_dir, "scheduler.pt")
+    if os.path.exists(scheduler_path):
+        scheduler_state = torch.load(scheduler_path, map_location="cpu")
+        lr_scheduler.load_state_dict(scheduler_state)
+        logger.info("Scheduler state loaded successfully")
+    else:
+        logger.warning(f"Scheduler state not found at {scheduler_path}, starting with fresh scheduler")
+
+    # Load RNG states
+    rng_path = os.path.join(checkpoint_dir, "rng_state.pt")
+    if os.path.exists(rng_path):
+        rng_state = torch.load(rng_path, map_location="cpu")
+        random.setstate(rng_state["python"])
+        np.random.set_state(rng_state["numpy"])
+        torch.set_rng_state(rng_state["torch"])
+        if torch.cuda.is_available() and rng_state["torch_cuda"] is not None:
+            torch.cuda.set_rng_state_all(rng_state["torch_cuda"])
+        logger.info("RNG states restored successfully")
+    else:
+        logger.warning(f"RNG state not found at {rng_path}, random states not restored")
+
+    logger.info(f"Checkpoint loaded successfully from {checkpoint_dir}")
+
+    return global_step, epoch
 
 
 if __name__ == "__main__":
