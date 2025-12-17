@@ -684,16 +684,25 @@ def flash_attn_func(*args, **kwargs):
             batches_to_skip = steps_in_current_epoch * args.gradient_accumulation_steps
             logger.info(f"Resuming mid-epoch: skipping {batches_to_skip} batches")
 
+        # Calculate total batches and current position for progress tracking
+        # Use total_training_steps to ensure batch progress aligns with step progress
+        total_batches = total_training_steps * args.gradient_accumulation_steps
+        batches_completed_so_far = global_step * args.gradient_accumulation_steps
+
         progress_bar = tqdm(
-            train_dataloader,
+            total=total_batches,
             desc=f"Epoch {epoch + 1}/{args.epochs}",
             disable=not accelerator.is_local_main_process,
+            initial=batches_completed_so_far,
         )
 
-        for step, batch in enumerate(progress_bar):
-            # Skip already-processed batches when resuming
+        for step, batch in enumerate(train_dataloader):
+            # Skip already-processed batches when resuming (without updating tqdm)
             if step < batches_to_skip:
                 continue
+
+            # Update progress bar only for actual training batches
+            progress_bar.update(1)
 
             with accelerator.accumulate(model):
                 # Forward pass (no need to move to device, accelerator handles it)
@@ -761,6 +770,9 @@ def flash_attn_func(*args, **kwargs):
                     }
                 )
 
+        # Close progress bar
+        progress_bar.close()
+
         # Reset steps_in_current_epoch after completing the first epoch
         if epoch == starting_epoch:
             steps_in_current_epoch = 0
@@ -818,39 +830,34 @@ def save_checkpoint(
     """
     accelerator.wait_for_everyone()
 
+    if epoch is not None:
+        save_dir = os.path.join(output_dir, f"checkpoint-epoch-{epoch}")
+        epoch_to_save = epoch  # For epoch checkpoints, use epoch value
+    else:
+        save_dir = os.path.join(output_dir, f"checkpoint-step-{step}")
+        epoch_to_save = current_epoch if current_epoch is not None else 0  # For step checkpoints, use current_epoch
+
     if accelerator.is_main_process:
-        if epoch is not None:
-            save_dir = os.path.join(output_dir, f"checkpoint-epoch-{epoch}")
-            epoch_to_save = epoch  # For epoch checkpoints, use epoch value
-        else:
-            save_dir = os.path.join(output_dir, f"checkpoint-step-{step}")
-            epoch_to_save = current_epoch if current_epoch is not None else 0  # For step checkpoints, use current_epoch
-
         os.makedirs(save_dir, exist_ok=True)
-
-        # Unwrap model from DDP/FSDP wrappers
-        unwrapped_model = accelerator.unwrap_model(model)
-
-        # Save model
         logger.info(f"Saving checkpoint to {save_dir}")
+
+    # Save model using save_pretrained (only on main process)
+    if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_model.save_pretrained(
             save_dir,
             save_function=accelerator.save,
             state_dict=accelerator.get_state_dict(model),
         )
-
-        # Save tokenizer
         tokenizer.save_pretrained(save_dir)
+        logger.info(f"Saved model and tokenizer to {save_dir}")
 
-        # Save optimizer state
-        optimizer_path = os.path.join(save_dir, "optimizer.pt")
-        accelerator.save(optimizer.state_dict(), optimizer_path)
-        logger.info(f"Saved optimizer state to {optimizer_path}")
+    # Use Accelerate's save_state for optimizer/scheduler (handles DeepSpeed ZeRO properly)
+    accelerator_state_dir = os.path.join(save_dir, "accelerator_state")
+    accelerator.save_state(accelerator_state_dir)
 
-        # Save scheduler state
-        scheduler_path = os.path.join(save_dir, "scheduler.pt")
-        accelerator.save(lr_scheduler.state_dict(), scheduler_path)
-        logger.info(f"Saved scheduler state to {scheduler_path}")
+    if accelerator.is_main_process:
+        logger.info(f"Saved optimizer/scheduler state to {accelerator_state_dir}")
 
         # Save RNG states
         rng_path = os.path.join(save_dir, "rng_state.pt")
@@ -878,6 +885,8 @@ def save_checkpoint(
         logger.info(f"Saved training metadata to {metadata_path}")
 
         logger.info(f"Checkpoint saved successfully to {save_dir}")
+
+    accelerator.wait_for_everyone()
 
 
 def load_checkpoint(
@@ -910,45 +919,65 @@ def load_checkpoint(
     logger.info("Loading model weights...")
     unwrapped_model = accelerator.unwrap_model(model)
 
-    # Find the model file (could be safetensors or bin)
-    model_files = ["model.safetensors", "pytorch_model.bin"]
-    model_file = None
-    for mf in model_files:
-        mf_path = os.path.join(checkpoint_dir, mf)
-        if os.path.exists(mf_path):
-            model_file = mf
-            break
+    # Check if this is a sharded checkpoint or single file
+    index_file = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    single_safetensors = os.path.join(checkpoint_dir, "model.safetensors")
+    single_bin = os.path.join(checkpoint_dir, "pytorch_model.bin")
 
-    if model_file is None:
+    if os.path.exists(index_file) or os.path.exists(single_safetensors) or os.path.exists(single_bin):
+        # Use from_pretrained to handle both sharded and single-file checkpoints
+        logger.info("Loading model weights using from_pretrained (handles sharded checkpoints)...")
+        state_dict = unwrapped_model.__class__.from_pretrained(
+            checkpoint_dir,
+            state_dict=None,
+            local_files_only=True,
+        ).state_dict()
+        unwrapped_model.load_state_dict(state_dict, strict=False)
+        logger.info("Model weights loaded successfully")
+    else:
         raise ValueError(f"No model file found in {checkpoint_dir}")
 
-    # Load state dict
-    state_dict = torch.load(os.path.join(checkpoint_dir, model_file), map_location="cpu")
-    unwrapped_model.load_state_dict(state_dict, strict=False)
-    logger.info("Model weights loaded successfully")
-
-    # Load optimizer state
-    optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
-    if os.path.exists(optimizer_path):
-        optimizer_state = torch.load(optimizer_path, map_location="cpu")
-        optimizer.load_state_dict(optimizer_state)
-        logger.info("Optimizer state loaded successfully")
+    # Load optimizer/scheduler state
+    # First try new format (accelerator_state dir)
+    accelerator_state_dir = os.path.join(checkpoint_dir, "accelerator_state")
+    if os.path.exists(accelerator_state_dir):
+        try:
+            accelerator.load_state(accelerator_state_dir)
+            logger.info("Optimizer and scheduler state loaded successfully from accelerator_state")
+        except Exception as e:
+            logger.warning(f"Failed to load accelerator state: {e}")
+            logger.warning("Continuing with fresh optimizer/scheduler state.")
     else:
-        logger.warning(f"Optimizer state not found at {optimizer_path}, starting with fresh optimizer")
+        # Fall back to old format (separate optimizer.pt and scheduler.pt files)
+        logger.info("Accelerator state directory not found, trying legacy checkpoint format...")
 
-    # Load scheduler state
-    scheduler_path = os.path.join(checkpoint_dir, "scheduler.pt")
-    if os.path.exists(scheduler_path):
-        scheduler_state = torch.load(scheduler_path, map_location="cpu")
-        lr_scheduler.load_state_dict(scheduler_state)
-        logger.info("Scheduler state loaded successfully")
-    else:
-        logger.warning(f"Scheduler state not found at {scheduler_path}, starting with fresh scheduler")
+        optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
+        if os.path.exists(optimizer_path):
+            try:
+                optimizer_state = torch.load(optimizer_path, map_location="cpu", weights_only=False)
+                optimizer.load_state_dict(optimizer_state)
+                logger.info("Optimizer state loaded successfully (legacy format)")
+            except (KeyError, RuntimeError) as e:
+                logger.warning(f"Failed to load optimizer state (likely due to DeepSpeed ZeRO sharding mismatch): {e}")
+                logger.warning("Continuing with fresh optimizer state. Momentum will be reset.")
+        else:
+            logger.warning(f"Optimizer state not found, starting with fresh optimizer")
+
+        scheduler_path = os.path.join(checkpoint_dir, "scheduler.pt")
+        if os.path.exists(scheduler_path):
+            try:
+                scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
+                lr_scheduler.load_state_dict(scheduler_state)
+                logger.info("Scheduler state loaded successfully (legacy format)")
+            except Exception as e:
+                logger.warning(f"Failed to load scheduler state: {e}")
+        else:
+            logger.warning(f"Scheduler state not found, starting with fresh scheduler")
 
     # Load RNG states
     rng_path = os.path.join(checkpoint_dir, "rng_state.pt")
     if os.path.exists(rng_path):
-        rng_state = torch.load(rng_path, map_location="cpu")
+        rng_state = torch.load(rng_path, map_location="cpu", weights_only=False)
         random.setstate(rng_state["python"])
         np.random.set_state(rng_state["numpy"])
         torch.set_rng_state(rng_state["torch"])
