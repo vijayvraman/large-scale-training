@@ -781,6 +781,24 @@ def flash_attn_func(*args, **kwargs):
             if accelerator.sync_gradients:
                 global_step += 1
 
+                # Check if we've completed training
+                if global_step >= total_training_steps:
+                    logger.info(f"Reached total_training_steps ({total_training_steps}), saving final checkpoint and stopping training.")
+                    # Save final checkpoint before stopping
+                    save_checkpoint(
+                        accelerator=accelerator,
+                        model=model,
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler,
+                        tokenizer=tokenizer,
+                        output_dir=args.output_dir,
+                        step=global_step,
+                        epoch=epoch + 1,
+                        args=args,
+                    )
+                    progress_bar.close()
+                    break
+
                 # Logging
                 if global_step % args.logging_steps == 0:
                     avg_loss = total_loss / args.logging_steps
@@ -825,6 +843,11 @@ def flash_attn_func(*args, **kwargs):
 
         # Close progress bar
         progress_bar.close()
+
+        # Check if we broke out early due to reaching total steps
+        if global_step >= total_training_steps:
+            logger.info(f"Training complete at {global_step} steps")
+            break
 
         # Reset steps_in_current_epoch after completing the first epoch
         if epoch == starting_epoch:

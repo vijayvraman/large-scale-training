@@ -1,7 +1,6 @@
 {
-  "train_batch_size": 32,
   "train_micro_batch_size_per_gpu": 4,
-  "gradient_accumulation_steps": 4,
+  "gradient_accumulation_steps": 8,
   "steps_per_print": 100,
   "zero_optimization": {
     "stage": 2,
@@ -10,8 +9,8 @@
     },
     "overlap_comm": true,
     "contiguous_gradients": true,
-    "reduce_bucket_size": 5e7,
-    "allgather_bucket_size": 5e7
+    "reduce_bucket_size": 50000000.0,
+    "allgather_bucket_size": 50000000.0
   },
   "bf16": {
     "enabled": true
@@ -25,4 +24,3 @@
     "combine_experts": false
   }
 }
-

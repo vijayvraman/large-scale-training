@@ -3,7 +3,7 @@
 nohup env PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py 2>&1 | TZ=America/Los_Angeles ts '[%Y-%m-%d %H:%M:%S %Z]' > nohup.out &
 
 #resume training (update checkpoint number as needed)
-#nohup env PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py --resume_from_checkpoint ./mpt7b_moe_finetune/checkpoint-step-5000 2>&1 | TZ=America/Los_Angeles ts '[%Y-%m-%d %H:%M:%S %Z]' > nohup.out &
+#nohup env PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py --resume_from_checkpoint ./mpt7b_moe_finetune/checkpoint-step-2000 2>&1 | TZ=America/Los_Angeles ts '[%Y-%m-%d %H:%M:%S %Z]' > nohup.out &
 
 # Replace checkpoint number with epoch
 #python upload_to_hub.py       --model_path ./mpt7b_moe_finetune/checkpoint-epoch-1       --repo_name vvijayk/mpt-7b-moe-nq-finetuned
