@@ -601,14 +601,62 @@ def flash_attn_func(*args, **kwargs):
     )
 
     # Calculate total training steps
-    # Note: We'll create the dataloader per epoch with deterministic seeding
-    num_batches_per_epoch = math.ceil(len(train_dataset) / args.per_device_batch_size)
+    # We need to account for multi-GPU sharding, so create a temporary dataloader
+    # to get the actual number of batches per device
+    temp_dataloader = get_dataloader_with_epoch_seed(
+        dataset=train_dataset,
+        batch_size=args.per_device_batch_size,
+        collate_fn=collate_fn,
+        seed=args.seed,
+        epoch=0,
+    )
+    temp_dataloader = accelerator.prepare(temp_dataloader)
+    num_batches_per_epoch_per_device = len(temp_dataloader)
+
+    # Use accelerator's actual gradient_accumulation_steps (may differ from args if using DeepSpeed config)
+    actual_gradient_accumulation_steps = accelerator.gradient_accumulation_steps
+    if actual_gradient_accumulation_steps != args.gradient_accumulation_steps:
+        logger.warning(
+            f"Gradient accumulation steps mismatch! "
+            f"args={args.gradient_accumulation_steps}, "
+            f"accelerator (from DeepSpeed config)={actual_gradient_accumulation_steps}. "
+            f"Using accelerator value for calculations."
+        )
+
     num_update_steps_per_epoch = math.ceil(
-        num_batches_per_epoch / args.gradient_accumulation_steps
+        num_batches_per_epoch_per_device / actual_gradient_accumulation_steps
     )
     total_training_steps = args.epochs * num_update_steps_per_epoch
+    del temp_dataloader  # Free memory
 
-    # Learning rate scheduler
+    # Initialize training state
+    starting_epoch = 0
+    global_step = 0
+    steps_in_current_epoch = 0
+
+    # Check if we're resuming from a checkpoint
+    if args.resume_from_checkpoint:
+        # Load checkpoint metadata to get the global_step
+        metadata_path = os.path.join(args.resume_from_checkpoint, "training_state.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+            global_step = metadata.get("global_step", 0)
+            starting_epoch = metadata.get("epoch", 0)
+            steps_in_current_epoch = global_step - (starting_epoch * num_update_steps_per_epoch)
+            logger.info(f"Found checkpoint at global_step={global_step}, epoch={starting_epoch}")
+        else:
+            logger.warning(f"Checkpoint metadata not found at {metadata_path}, starting from scratch")
+
+    # Calculate remaining training steps for learning rate scheduler
+    remaining_steps = total_training_steps - global_step
+
+    logger.info(f"Creating LR scheduler: total_steps={total_training_steps}, "
+                f"completed_steps={global_step}, remaining_steps={remaining_steps}, "
+                f"warmup_steps={args.warmup_steps}")
+
+    # Learning rate scheduler - always use total steps for proper resumption
+    # When we load the scheduler state, it will have the correct step count
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=args.warmup_steps,
@@ -621,12 +669,7 @@ def flash_attn_func(*args, **kwargs):
         model, optimizer, lr_scheduler
     )
 
-    # Initialize training state
-    starting_epoch = 0
-    global_step = 0
-    steps_in_current_epoch = 0
-
-    # Load checkpoint if resuming
+    # Load checkpoint if resuming (load optimizer/scheduler states after preparing)
     if args.resume_from_checkpoint:
         logger.info(f"Resuming training from checkpoint: {args.resume_from_checkpoint}")
         loaded_global_step, loaded_epoch = load_checkpoint(
@@ -634,22 +677,28 @@ def flash_attn_func(*args, **kwargs):
             accelerator=accelerator,
             model=model,
             optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
+            lr_scheduler=lr_scheduler,  # Load scheduler state for proper LR resumption
         )
-        global_step = loaded_global_step
-        starting_epoch = loaded_epoch
-        # Calculate how many steps were completed in the current epoch
-        steps_in_current_epoch = global_step - (starting_epoch * num_update_steps_per_epoch)
+        # Verify the loaded values match what we read earlier
+        if loaded_global_step != global_step:
+            logger.warning(f"Global step mismatch: expected {global_step}, got {loaded_global_step}")
+            global_step = loaded_global_step
+            starting_epoch = loaded_epoch
+            steps_in_current_epoch = global_step - (starting_epoch * num_update_steps_per_epoch)
         logger.info(f"Resuming from epoch {starting_epoch}, global_step {global_step}, steps_in_current_epoch {steps_in_current_epoch}")
+        logger.info(f"Resumed learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
 
     logger.info("=" * 50)
     logger.info(f"Total examples: {len(train_dataset)}")
+    logger.info(f"Examples per device (after sharding): {num_batches_per_epoch_per_device}")
     logger.info(f"Epochs: {args.epochs}")
     logger.info(f"Starting epoch: {starting_epoch}")
     logger.info(f"Starting global_step: {global_step}")
     logger.info(f"Batch size per device: {args.per_device_batch_size}")
-    logger.info(f"Total batch size (with parallel & accumulation): {args.per_device_batch_size * accelerator.num_processes * args.gradient_accumulation_steps}")
-    logger.info(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
+    logger.info(f"Gradient accumulation steps: {actual_gradient_accumulation_steps}")
+    logger.info(f"Number of devices: {accelerator.num_processes}")
+    logger.info(f"Total batch size (with parallel & accumulation): {args.per_device_batch_size * accelerator.num_processes * actual_gradient_accumulation_steps}")
+    logger.info(f"Update steps per epoch: {num_update_steps_per_epoch}")
     logger.info(f"Total optimization steps: {total_training_steps}")
     logger.info("=" * 50)
 
@@ -681,13 +730,17 @@ def flash_attn_func(*args, **kwargs):
         batches_to_skip = 0
         if epoch == starting_epoch and steps_in_current_epoch > 0:
             # We need to skip batches we've already processed
-            batches_to_skip = steps_in_current_epoch * args.gradient_accumulation_steps
-            logger.info(f"Resuming mid-epoch: skipping {batches_to_skip} batches")
+            # Note: The dataloader is sharded across num_processes, so each process
+            # only sees a fraction of the total batches
+            total_batches_to_skip = steps_in_current_epoch * actual_gradient_accumulation_steps
+            batches_to_skip = total_batches_to_skip // accelerator.num_processes
+            logger.info(f"Resuming mid-epoch: skipping {batches_to_skip} batches per process "
+                       f"({total_batches_to_skip} total batches across {accelerator.num_processes} processes)")
 
         # Calculate total batches and current position for progress tracking
         # Use total_training_steps to ensure batch progress aligns with step progress
-        total_batches = total_training_steps * args.gradient_accumulation_steps
-        batches_completed_so_far = global_step * args.gradient_accumulation_steps
+        total_batches = total_training_steps * actual_gradient_accumulation_steps
+        batches_completed_so_far = global_step * actual_gradient_accumulation_steps
 
         progress_bar = tqdm(
             total=total_batches,
@@ -940,39 +993,78 @@ def load_checkpoint(
     # Load optimizer/scheduler state
     # First try new format (accelerator_state dir)
     accelerator_state_dir = os.path.join(checkpoint_dir, "accelerator_state")
-    if os.path.exists(accelerator_state_dir):
-        try:
-            accelerator.load_state(accelerator_state_dir)
-            logger.info("Optimizer and scheduler state loaded successfully from accelerator_state")
-        except Exception as e:
-            logger.warning(f"Failed to load accelerator state: {e}")
-            logger.warning("Continuing with fresh optimizer/scheduler state.")
-    else:
-        # Fall back to old format (separate optimizer.pt and scheduler.pt files)
-        logger.info("Accelerator state directory not found, trying legacy checkpoint format...")
 
-        optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
-        if os.path.exists(optimizer_path):
-            try:
-                optimizer_state = torch.load(optimizer_path, map_location="cpu", weights_only=False)
-                optimizer.load_state_dict(optimizer_state)
-                logger.info("Optimizer state loaded successfully (legacy format)")
-            except (KeyError, RuntimeError) as e:
-                logger.warning(f"Failed to load optimizer state (likely due to DeepSpeed ZeRO sharding mismatch): {e}")
-                logger.warning("Continuing with fresh optimizer state. Momentum will be reset.")
-        else:
-            logger.warning(f"Optimizer state not found, starting with fresh optimizer")
+    if lr_scheduler is None:
+        # Skip loading scheduler state - we created a fresh one for resumption
+        logger.info("Skipping scheduler state loading (using fresh scheduler for resumption)")
 
-        scheduler_path = os.path.join(checkpoint_dir, "scheduler.pt")
-        if os.path.exists(scheduler_path):
+        # Load only optimizer state from accelerator_state
+        if os.path.exists(accelerator_state_dir):
             try:
-                scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
-                lr_scheduler.load_state_dict(scheduler_state)
-                logger.info("Scheduler state loaded successfully (legacy format)")
+                # Load optimizer state manually from the accelerator_state directory
+                optimizer_state_pattern = os.path.join(accelerator_state_dir, "pytorch_model", "*_optim_states.pt")
+                import glob
+                optimizer_files = glob.glob(optimizer_state_pattern)
+                if optimizer_files:
+                    logger.info(f"Found optimizer state files, loading via accelerator.load_state")
+                    # Note: accelerator.load_state will load both optimizer and scheduler
+                    # but since we're not using the old scheduler, the loaded scheduler state won't affect us
+                    accelerator.load_state(accelerator_state_dir)
+                    logger.info("Optimizer state loaded successfully from accelerator_state")
+                else:
+                    logger.warning("No optimizer state files found in accelerator_state")
             except Exception as e:
-                logger.warning(f"Failed to load scheduler state: {e}")
+                logger.warning(f"Failed to load accelerator state: {e}")
+                logger.warning("Continuing with fresh optimizer state.")
         else:
-            logger.warning(f"Scheduler state not found, starting with fresh scheduler")
+            # Fall back to old format (separate optimizer.pt file)
+            logger.info("Accelerator state directory not found, trying legacy checkpoint format...")
+            optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
+            if os.path.exists(optimizer_path):
+                try:
+                    optimizer_state = torch.load(optimizer_path, map_location="cpu", weights_only=False)
+                    optimizer.load_state_dict(optimizer_state)
+                    logger.info("Optimizer state loaded successfully (legacy format)")
+                except (KeyError, RuntimeError) as e:
+                    logger.warning(f"Failed to load optimizer state: {e}")
+                    logger.warning("Continuing with fresh optimizer state.")
+            else:
+                logger.warning(f"Optimizer state not found, starting with fresh optimizer")
+    else:
+        # Load both optimizer and scheduler state (normal resumption)
+        if os.path.exists(accelerator_state_dir):
+            try:
+                accelerator.load_state(accelerator_state_dir)
+                logger.info("Optimizer and scheduler state loaded successfully from accelerator_state")
+            except Exception as e:
+                logger.warning(f"Failed to load accelerator state: {e}")
+                logger.warning("Continuing with fresh optimizer/scheduler state.")
+        else:
+            # Fall back to old format (separate optimizer.pt and scheduler.pt files)
+            logger.info("Accelerator state directory not found, trying legacy checkpoint format...")
+
+            optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
+            if os.path.exists(optimizer_path):
+                try:
+                    optimizer_state = torch.load(optimizer_path, map_location="cpu", weights_only=False)
+                    optimizer.load_state_dict(optimizer_state)
+                    logger.info("Optimizer state loaded successfully (legacy format)")
+                except (KeyError, RuntimeError) as e:
+                    logger.warning(f"Failed to load optimizer state (likely due to DeepSpeed ZeRO sharding mismatch): {e}")
+                    logger.warning("Continuing with fresh optimizer state. Momentum will be reset.")
+            else:
+                logger.warning(f"Optimizer state not found, starting with fresh optimizer")
+
+            scheduler_path = os.path.join(checkpoint_dir, "scheduler.pt")
+            if os.path.exists(scheduler_path):
+                try:
+                    scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
+                    lr_scheduler.load_state_dict(scheduler_state)
+                    logger.info("Scheduler state loaded successfully (legacy format)")
+                except Exception as e:
+                    logger.warning(f"Failed to load scheduler state: {e}")
+            else:
+                logger.warning(f"Scheduler state not found, starting with fresh scheduler")
 
     # Load RNG states
     rng_path = os.path.join(checkpoint_dir, "rng_state.pt")
