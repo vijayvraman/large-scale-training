@@ -6,10 +6,10 @@ Train MPT-7B Mixture of Experts (MoE) models using HuggingFace Transformers, Acc
 
 - **Model**: MPT-7B (mosaicml/mpt-7b)
 - **Dataset**: Natural Questions (NQ Open) - 87,925 Q&A pairs
-- **Hardware**: 2x NVIDIA H100 80GB GPUs
+- **Hardware**: 4x NVIDIA H100 80GB GPUs
 - **Training Framework**: DeepSpeed ZeRO Stage 2 with HuggingFace Accelerate
 - **Expert Configuration**: 4 experts (factual_lookup, numerical_reasoning, multi_hop_reasoning, commonsense_reasoning)
-- **Training Time**: ~2-2.5 hours per epoch (optimized)
+- **Training Time**: ~1 hour combined for 2 epochs (default configuration)
 
 ## Features
 
@@ -17,6 +17,8 @@ Train MPT-7B Mixture of Experts (MoE) models using HuggingFace Transformers, Acc
 - DeepSpeed ZeRO Stage 2 optimization for optimal speed/memory balance
 - Mixed precision training (BF16)
 - Natural Questions dataset with expert routing annotations
+- **Automatic GPU detection and configuration** via setup utility
+- **Cosine annealing learning rate schedule** for better convergence
 - **Mid-epoch resumable training** with complete state preservation
 - Deterministic data loading for reproducible training
 - Automatic checkpointing with optimizer and scheduler state
@@ -27,7 +29,7 @@ Train MPT-7B Mixture of Experts (MoE) models using HuggingFace Transformers, Acc
 ## Requirements
 
 - Python 3.8+
-- CUDA-capable GPUs (optimized for 2x H100 80GB)
+- CUDA-capable GPUs (currently configured for 4x H100 80GB)
 - DeepSpeed, Transformers, Accelerate
 
 ## Installation
@@ -40,6 +42,9 @@ pip install -r requirements.txt
 python -c "import torch; print(f'PyTorch: {torch.__version__}')"
 python -c "import deepspeed; print(f'DeepSpeed: {deepspeed.__version__}')"
 python -c "import accelerate; print(f'Accelerate: {accelerate.__version__}')"
+
+# Configure for your GPU setup (recommended)
+python setup_gpu_config.py
 ```
 
 ## Dataset Format
@@ -71,7 +76,31 @@ The `answer` field can be:
 
 ## Configuration
 
-### 1. Accelerate Config (`accelerate_config.yaml`)
+### Automatic Configuration (Recommended)
+
+The easiest way to configure your setup is to use the automatic configuration utility:
+
+```bash
+python setup_gpu_config.py
+```
+
+This script will:
+- Automatically detect the number of available GPUs
+- Update `accelerate_config.yaml` with the correct `num_processes` and `distributed_type`
+- Update `deepspeed_moe_config.json` with the correct `gradient_accumulation_steps`
+- Calculate and display the expected total batch size
+- Extract default values from the training script for consistency
+
+**Custom gradient accumulation:**
+```bash
+python setup_gpu_config.py --gradient-accumulation-steps 8
+```
+
+### Manual Configuration
+
+If you prefer to configure manually:
+
+#### 1. Accelerate Config (`accelerate_config.yaml`)
 
 Adjust `num_processes` to match your number of GPUs:
 
@@ -79,15 +108,14 @@ Adjust `num_processes` to match your number of GPUs:
 num_processes: 4  # Change to your GPU count
 ```
 
-### 2. DeepSpeed Config (`deepspeed_moe_config.json`)
+#### 2. DeepSpeed Config (`deepspeed_moe_config.json`)
 
 **Current Optimized Configuration (ZeRO Stage 2):**
 
 ```json
 {
-  "train_batch_size": 32,
   "train_micro_batch_size_per_gpu": 4,
-  "gradient_accumulation_steps": 4,
+  "gradient_accumulation_steps": 8,
   "zero_optimization": {
     "stage": 2,
     "offload_optimizer": {"device": "none"},
@@ -103,18 +131,30 @@ num_processes: 4  # Change to your GPU count
 }
 ```
 
+**Note**: The `train_batch_size` is now auto-calculated by DeepSpeed based on the formula: `micro_batch_size × gradient_accumulation_steps × num_gpus`
+
 **Key Configuration Details:**
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | **ZeRO Stage** | 2 | Shards optimizer + gradients across GPUs (no CPU offload) |
 | **Micro batch per GPU** | 4 | Actual batch size loaded per GPU |
-| **Gradient accumulation** | 4 | Accumulate over 4 steps before optimizer update |
-| **Effective batch size** | 32 | 2 GPUs × 4 micro batch × 4 accumulation |
+| **Gradient accumulation** | 8 | Accumulate over 8 steps before optimizer update |
+| **Effective batch size** | 128 | 4 GPUs × 4 micro batch × 8 accumulation |
 | **Sequence length** | 256 | Maximum token length (set via --max_seq_length) |
 | **Precision** | bfloat16 | Better numerical stability than fp16 |
 
 ## Training
+
+### Before Training (Recommended)
+
+Configure your environment to match your GPU setup:
+
+```bash
+python setup_gpu_config.py
+```
+
+This ensures that all configuration files are properly synchronized with your hardware.
 
 ### Basic Training
 
@@ -138,6 +178,17 @@ accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerat
     --save_steps 500
 ```
 
+### Learning Rate Schedule
+
+The training uses a **cosine annealing schedule** for the learning rate:
+
+- Provides smoother decay compared to linear schedules
+- Learning rate follows a cosine curve, staying higher for longer during training
+- Results in better convergence and final model quality
+- Automatically adapts to the total number of training steps
+
+When resuming from a checkpoint, the scheduler state is fully restored to continue the schedule seamlessly.
+
 ### Resuming Training from Checkpoint
 
 ```bash
@@ -149,11 +200,19 @@ accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerat
     --output_dir ./mpt7b_moe_checkpoints
 ```
 
-**Note**: The training will automatically:
-- Restore model, optimizer, and scheduler states
-- Skip already-processed batches if resuming mid-epoch
-- Continue with the same learning rate schedule
-- Maintain reproducible data ordering
+**What Gets Restored:**
+- Model weights
+- Optimizer state (Adam momentum, adaptive learning rates)
+- **Learning rate scheduler state** (for proper cosine annealing continuation)
+- Training counters (global step, epoch)
+- Random states (PyTorch, NumPy, Python) for reproducibility
+- Data loading position within the epoch
+
+**Automatic Handling:**
+- Efficiently skips already-processed batches when resuming mid-epoch
+- Properly accounts for gradient accumulation steps from DeepSpeed config
+- Maintains exact learning rate schedule continuity
+- Works seamlessly with multi-GPU distributed training
 
 ### All Available Arguments
 
@@ -169,7 +228,7 @@ accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerat
 --max_target_length           Maximum target length (default: 128)
 
 # Training settings
---epochs                       Number of epochs (default: 1)
+--epochs                       Number of epochs (default: 2)
 --learning_rate               Learning rate (default: 2e-5)
 --per_device_batch_size       Batch size per GPU (default: 1)
 --gradient_accumulation_steps Gradient accumulation (default: 8)
@@ -193,7 +252,7 @@ Test with limited samples:
 ```bash
 accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py \
     --max_samples 100 \
-    --epochs 1 \
+    --epochs 2 \
     --save_steps 50
 ```
 
@@ -465,6 +524,8 @@ Step 510/10000 | Loss: 2.1234 | LR: 1.98e-05
 
 ## Configuration Optimization Journey
 
+**Note**: This section documents the historical evolution of the configuration. The current setup uses 4x H100 GPUs with gradient accumulation of 8 (see Quick Reference section above).
+
 ### Evolution of Configuration
 
 #### Initial Setup (ZeRO Stage 3 + CPU Offloading)
@@ -500,13 +561,13 @@ Process has 70.15 GiB in use (62.03 GiB by PyTorch)
 - Memory breakdown: 62 GB (model+optimizer+gradients) + 12 GB (activations) = 74 GB
 - Exceeded 79 GB available on H100
 
-#### Final Optimized Configuration (Current)
+#### Final Optimized Configuration
 **Solution**: ZeRO Stage 2 with `max_seq_length=256` and `micro_batch_size=4`
 
 ```json
 {
   "train_micro_batch_size_per_gpu": 4,
-  "gradient_accumulation_steps": 4,
+  "gradient_accumulation_steps": 8,
   "zero_optimization": {
     "stage": 2,
     "offload_optimizer": {"device": "none"}
@@ -514,10 +575,11 @@ Process has 70.15 GiB in use (62.03 GiB by PyTorch)
 }
 ```
 
-- **GPU Usage**: ~40-50 GB (50-60% utilization - safe margin)
-- **Speed**: ~2-3 it/s (1.5-2x faster than Stage 3)
-- **Training Time**: ~2-2.5 hours per epoch (3x faster)
-- **Total iterations**: ~10,990 optimizer steps per epoch
+**Key Insights**:
+- ZeRO Stage 2 provides the best balance of speed and memory efficiency
+- Reducing sequence length from 512 to 256 resolved OOM issues
+- Gradient accumulation allows larger effective batch sizes without memory increase
+- 4x GPU setup with gradient accumulation of 8 achieves ~1 hour for 2 epochs
 
 ### Memory Usage Breakdown
 
@@ -652,11 +714,13 @@ If training is too slow:
 ```
 .
 ├── train_mpt7b_moe_accelerate.py  # Main training script
+├── setup_gpu_config.py            # Automatic GPU detection & config sync
 ├── prepare_dataset.py              # Dataset annotation with expert labels
-├── accelerate_config.yaml         # Accelerate distributed config (2 GPUs)
+├── accelerate_config.yaml         # Accelerate distributed config
 ├── deepspeed_moe_config.json      # DeepSpeed ZeRO Stage 2 config
 ├── nq_annotated_moe.jsonl         # Annotated NQ dataset (87,925 samples)
 ├── mpt7b_moe_finetune/            # Output directory (checkpoints)
+├── cmdline                        # Example command lines for training
 └── README.md                      # This file (comprehensive guide)
 ```
 
@@ -702,21 +766,19 @@ This training code is provided as-is. Please refer to the respective licenses of
 ### Current Optimized Settings
 ```bash
 # Hardware
-2x NVIDIA H100 80GB GPUs
+4x NVIDIA H100 80GB GPUs
 
 # Configuration
 ZeRO Stage: 2 (no CPU offload)
 Micro batch per GPU: 4
-Gradient accumulation: 4
-Effective batch size: 32
+Gradient accumulation: 8
+Effective batch size: 128
 Sequence length: 256
 Precision: bfloat16
+Epochs: 2 (default)
 
 # Performance
-GPU memory usage: ~40-50 GB per GPU
-Training speed: ~2-3 it/s
-Training time: ~2-2.5 hours per epoch
-Total optimizer steps: ~10,991 per epoch
+Training time: ~1 hour combined for 2 epochs
 ```
 
 ### Common Commands
@@ -741,10 +803,11 @@ pkill -f train_mpt7b_moe_accelerate.py
 |------|---------------|-----------------|
 | ZeRO Stage | 2 | `deepspeed_moe_config.json` → `zero_optimization.stage` |
 | Micro batch size | 4 | `deepspeed_moe_config.json` → `train_micro_batch_size_per_gpu` |
-| Gradient accumulation | 4 | `deepspeed_moe_config.json` → `gradient_accumulation_steps` |
+| Gradient accumulation | 8 | `deepspeed_moe_config.json` → `gradient_accumulation_steps` |
 | Sequence length | 256 | Command line: `--max_seq_length 256` |
-| Number of GPUs | 2 | `accelerate_config.yaml` → `num_processes` |
+| Number of GPUs | 4 | `accelerate_config.yaml` → `num_processes` (or use `setup_gpu_config.py`) |
 | Learning rate | 2e-5 | Command line: `--learning_rate 2e-5` |
+| Epochs | 2 | Command line: `--epochs 2` |
 
 ## Support
 
@@ -755,6 +818,12 @@ For issues:
 
 ---
 
-**Last Updated**: 2025-11-25
-**Hardware**: 2x H100 80GB
-**Status**: Optimized for ZeRO Stage 2 with 4x micro batch, ~2-2.5 hour training per epoch
+**Last Updated**: 2025-12-20
+**Hardware**: 4x H100 80GB
+**Status**: ZeRO Stage 2 with 4x micro batch, 8x gradient accumulation (effective batch: 128)
+**Recent Updates**:
+- Added automatic GPU detection and configuration utility (`setup_gpu_config.py`)
+- Implemented cosine annealing learning rate schedule for better convergence
+- Improved checkpoint resumption with proper scheduler state handling
+- Enhanced gradient accumulation step synchronization with DeepSpeed config
+- Default epochs changed from 1 to 2
