@@ -36,6 +36,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoConfig,
     get_linear_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
     set_seed
 )
 from torch.utils.data import DataLoader
@@ -103,7 +104,7 @@ def parse_args():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=1,
+        default=2,
         help="Number of training epochs"
     )
     parser.add_argument(
@@ -655,9 +656,10 @@ def flash_attn_func(*args, **kwargs):
                 f"completed_steps={global_step}, remaining_steps={remaining_steps}, "
                 f"warmup_steps={args.warmup_steps}")
 
-    # Learning rate scheduler - always use total steps for proper resumption
-    # When we load the scheduler state, it will have the correct step count
-    lr_scheduler = get_linear_schedule_with_warmup(
+    # Learning rate scheduler - use cosine annealing for smoother decay
+    # Cosine decay stays above zero longer and provides better convergence
+    logger.info("Using cosine annealing schedule for learning rate decay")
+    lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=args.warmup_steps,
         num_training_steps=total_training_steps,
@@ -771,8 +773,11 @@ def flash_attn_func(*args, **kwargs):
 
                 # Optimizer step
                 optimizer.step()
-                lr_scheduler.step()
                 optimizer.zero_grad()
+
+            # Step scheduler only after gradients are synced (after accumulation)
+            if accelerator.sync_gradients:
+                lr_scheduler.step()
 
             # Accumulate loss
             total_loss += loss.detach().item()
