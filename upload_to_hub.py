@@ -127,7 +127,7 @@ print(answer)
 
 ## Training Configuration
 
-Training was performed using the configuration in the repository. See `train_mpt7b_moe_accelerate.py` for details.
+Training was performed using the configuration in the repository. See `train_mixtral_8x7b_moe_accelerate.py` for details.
 
 ## Limitations and Biases
 

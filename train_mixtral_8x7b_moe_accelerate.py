@@ -35,6 +35,8 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     AutoConfig,
+    MixtralForCausalLM,
+    MixtralConfig,
     get_linear_schedule_with_warmup,
     get_cosine_schedule_with_warmup,
     set_seed
@@ -45,6 +47,12 @@ import torch.nn as nn
 from accelerate import Accelerator
 from accelerate.utils import set_seed as accelerate_set_seed
 from tqdm.auto import tqdm
+from supervised_routing import (
+    SupervisedMoEWrapper,
+    ExpertLabelEmbedding,
+    compute_routing_supervision_loss,
+    get_expert_utilization_stats,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -158,7 +166,7 @@ def parse_args():
     parser.add_argument(
         "--convert_to_moe",
         action="store_true",
-        help="Attempt to convert model FFN layers to MoE (experimental)"
+        help="[DEPRECATED] Attempt to convert model FFN layers to MoE (experimental, not used with Mixtral)"
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -166,10 +174,43 @@ def parse_args():
         default=None,
         help="Path to checkpoint directory to resume training from"
     )
+    # Supervised Routing Arguments
+    parser.add_argument(
+        "--routing_loss_weight",
+        type=float,
+        default=0.1,
+        help="Weight for supervised routing loss (beta in loss equation). Higher = stronger supervision. Range: 0.05-0.5"
+    )
+    parser.add_argument(
+        "--disable_supervised_routing",
+        action="store_true",
+        help="Disable supervised routing and use standard MoE training without expert label guidance"
+    )
+    parser.add_argument(
+        "--label_embedding_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for expert label embedding softmax. Lower = harder category assignments. Range: 0.5-2.0"
+    )
     return parser.parse_args()
 
 # ---------------------------
 # Helpers: load annotated data
+# ---------------------------
+# Expert Label Mapping
+# ---------------------------
+# Map expert label strings to integer IDs for supervised routing
+EXPERT_LABEL_MAP = {
+    "factual_lookup": 0,
+    "numerical_reasoning": 1,
+    "multi_hop_reasoning": 2,
+    "commonsense_reasoning": 3,
+}
+
+def expert_label_to_id(label: str) -> int:
+    """Convert expert label string to integer ID."""
+    return EXPERT_LABEL_MAP.get(label, 0)  # Default to factual_lookup
+
 # ---------------------------
 def load_annotated_jsonl(path: str, max_samples: Optional[int] = None) -> List[Dict]:
     """Load annotated JSONL dataset with question, answer, and expert_label fields."""
@@ -231,6 +272,7 @@ class QADataset(torch.utils.data.Dataset):
         record = self.records[idx]
         question = record["question"]
         answer = record["answer"]
+        expert_label = record.get("expert_label", "factual_lookup")
 
         # Format: "Question: {q}\nAnswer: {a}"
         prompt = f"Question: {question}\nAnswer:"
@@ -261,10 +303,14 @@ class QADataset(torch.utils.data.Dataset):
         labels = input_ids.clone()
         labels[:prompt_len] = -100  # Mask prompt tokens
 
+        # Convert expert label to ID
+        expert_label_id = expert_label_to_id(expert_label)
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            "expert_label_ids": torch.tensor(expert_label_id, dtype=torch.long),
         }
 
 
@@ -274,6 +320,7 @@ def collate_fn(batch):
         "input_ids": torch.stack([b["input_ids"] for b in batch]),
         "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
         "labels": torch.stack([b["labels"] for b in batch]),
+        "expert_label_ids": torch.stack([b["expert_label_ids"] for b in batch]),
     }
 
 
@@ -418,163 +465,83 @@ def main():
 
     # Load tokenizer
     logger.info(f"Loading tokenizer from {args.model_id}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_id,
+        use_fast=True,  # Use fast tokenizer for better performance
+    )
 
+    # Mixtral uses <s> for BOS and </s> for EOS
     # Ensure tokenizer has pad token
     if tokenizer.pad_token is None:
-        if tokenizer.eos_token:
-            tokenizer.pad_token = tokenizer.eos_token
-            logger.info(f"Set pad_token to eos_token: {tokenizer.eos_token}")
-        else:
-            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-            logger.info("Added new pad token: <|pad|>")
+        tokenizer.pad_token = tokenizer.eos_token
+        logger.info(f"Set pad_token to eos_token: {tokenizer.eos_token}")
 
-    # Load model
-    logger.info(f"Loading model from {args.model_id}")
+    # Load Mixtral-8x7B MoE model
+    logger.info(f"Loading Mixtral MoE model from {args.model_id}")
 
-    # Patch HuggingFace cache to fix compatibility issues
-    # This needs to happen BEFORE any model loading
-    def patch_mpt_model_files():
-        """Patch downloaded MPT model files to fix compatibility issues."""
-        import glob
-        import sys
+    # Load model configuration with router logits enabled
+    logger.info("Loading Mixtral config with router logits enabled")
+    config = MixtralConfig.from_pretrained(
+        args.model_id,
+        output_router_logits=True,  # CRITICAL: Enable router logit output for supervised routing
+        router_aux_loss_coef=0.01,  # Load balancing loss weight (alpha in loss equation)
+    )
+    logger.info(f"Mixtral config loaded: {config.num_local_experts} experts, router_jitter_noise={config.router_jitter_noise}")
 
-        # Try multiple times as files may still be downloading
-        for attempt in range(3):
-            cache_dirs = glob.glob("/home/ubuntu/.cache/huggingface/modules/transformers_modules/mosaicml/mpt*/*/")
-
-            patched_any = False
-            for cache_dir in cache_dirs:
-                # Patch modeling_mpt.py for LlamaDynamicNTKScalingRotaryEmbedding import
-                modeling_file = os.path.join(cache_dir, "modeling_mpt.py")
-                if os.path.exists(modeling_file):
-                    with open(modeling_file, 'r') as f:
-                        content = f.read()
-
-                    if "HFDynamicNTKScalingRotaryEmbedding = None" not in content:
-                        # Patch all three Llama imports
-                        imports_to_patch = [
-                            ("from transformers.models.llama.modeling_llama import LlamaDynamicNTKScalingRotaryEmbedding as HFDynamicNTKScalingRotaryEmbedding",
-                             """try:
-    from transformers.models.llama.modeling_llama import LlamaDynamicNTKScalingRotaryEmbedding as HFDynamicNTKScalingRotaryEmbedding
-except ImportError:
-    HFDynamicNTKScalingRotaryEmbedding = None"""),
-                            ("from transformers.models.llama.modeling_llama import LlamaLinearScalingRotaryEmbedding as HFLinearScalingRotaryEmbedding",
-                             """try:
-    from transformers.models.llama.modeling_llama import LlamaLinearScalingRotaryEmbedding as HFLinearScalingRotaryEmbedding
-except ImportError:
-    HFLinearScalingRotaryEmbedding = None"""),
-                            ("from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as HFRotaryEmbedding",
-                             """try:
-    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as HFRotaryEmbedding
-except ImportError:
-    HFRotaryEmbedding = None""")
-                        ]
-
-                        for old_import, new_import in imports_to_patch:
-                            content = content.replace(old_import, new_import)
-
-                        with open(modeling_file, 'w') as f:
-                            f.write(content)
-                        logger.info(f"Patched {modeling_file}")
-                        patched_any = True
-
-                        # Clear any cached imports of this module
-                        module_path_base = cache_dir.replace("/home/ubuntu/.cache/huggingface/modules/", "").replace("/", ".")
-                        for key in list(sys.modules.keys()):
-                            if module_path_base in key:
-                                del sys.modules[key]
-                                logger.info(f"Cleared cached module: {key}")
-
-                # Create stub flash_attn_triton.py if missing
-                flash_attn_file = os.path.join(cache_dir, "flash_attn_triton.py")
-                if not os.path.exists(flash_attn_file):
-                    with open(flash_attn_file, 'w') as f:
-                        f.write('''"""Stub file for flash_attn_triton to satisfy import checks."""
-def flash_attn_func(*args, **kwargs):
-    raise NotImplementedError("Flash attention with Triton is not available. Use attn_impl='torch'.")
-''')
-                    logger.info(f"Created stub {flash_attn_file}")
-                    patched_any = True
-
-            if patched_any or len(cache_dirs) > 0:
-                break
-            time.sleep(0.5)
-
-    # Pre-emptively try to patch any existing cached files
-    # DISABLED: transformers 4.47.0 should be compatible
-    patch_mpt_model_files()
-
-    # First, load and modify the config to use torch attention instead of flash attention
-    # This avoids triton_pre_mlir dependency issues
-    logger.info("Loading config and setting attn_impl to 'torch'")
+    # Load Mixtral model with bfloat16
     try:
-        config = AutoConfig.from_pretrained(
-            args.model_id,
-            trust_remote_code=True,
-        )
-    except Exception as e:
-        logger.warning(f"Initial config load failed, patching model files again: {e}")
-        time.sleep(1)  # Give downloads time to complete
-        patch_mpt_model_files()
-        config = AutoConfig.from_pretrained(
-            args.model_id,
-            trust_remote_code=True,
-        )
-    # Set attention implementation to torch
-    if hasattr(config, 'attn_config'):
-        config.attn_config['attn_impl'] = 'torch'
-    else:
-        config.attn_config = {'attn_impl': 'torch'}
-
-    logger.info(f"Attention config: {config.attn_config}")
-
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
+        model = MixtralForCausalLM.from_pretrained(
             args.model_id,
             config=config,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,  # Use bfloat16 for better stability
+            torch_dtype=torch.bfloat16,  # Use bfloat16 for better stability and memory efficiency
+            device_map=None,  # Let Accelerate handle device placement
         )
+        logger.info(f"Mixtral model loaded successfully with bfloat16")
     except Exception as e:
         logger.warning(f"Failed to load with bfloat16, trying float16: {e}")
-        model = AutoModelForCausalLM.from_pretrained(
+        model = MixtralForCausalLM.from_pretrained(
             args.model_id,
             config=config,
-            trust_remote_code=True,
             torch_dtype=torch.float16,
+            device_map=None,
         )
+        logger.info(f"Mixtral model loaded with float16")
 
-    # Resize token embeddings if we added new tokens
-    model.resize_token_embeddings(len(tokenizer))
-    logger.info(f"Model loaded. Total parameters: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
+    # Report model size
+    total_params = sum(p.numel() for p in model.parameters()) / 1e9
+    logger.info(f"Model loaded. Total parameters: {total_params:.2f}B")
+    logger.info(f"Active parameters per forward pass (2 of 8 experts): ~{total_params * 2 / 8:.2f}B")
 
-    # Enable gradient checkpointing to reduce memory usage (if supported)
+    # Enable gradient checkpointing to reduce memory usage
     try:
-        logger.info("Attempting to enable gradient checkpointing for memory efficiency")
+        logger.info("Enabling gradient checkpointing for memory efficiency")
         model.gradient_checkpointing_enable()
         logger.info("Gradient checkpointing enabled successfully")
     except (ValueError, AttributeError) as e:
-        logger.warning(f"Gradient checkpointing not supported for this model: {e}")
+        logger.warning(f"Gradient checkpointing not supported: {e}")
         logger.info("Continuing without gradient checkpointing")
 
-    # Optionally convert model to MoE (experimental)
-    if args.convert_to_moe:
-        logger.info("Converting model to MoE (experimental)")
-        try:
-            # Read num_experts from deepspeed config if available
-            deepspeed_config_path = "deepspeed_moe_config.json"
-            num_experts = 4
-            if os.path.exists(deepspeed_config_path):
-                with open(deepspeed_config_path, "r") as f:
-                    ds_config = json.load(f)
-                    num_experts = ds_config.get("moe", {}).get("num_experts", 4)
-                    logger.info(f"Using num_experts={num_experts} from DeepSpeed config")
+    # Wrap model with supervised routing wrapper
+    if not args.disable_supervised_routing:
+        logger.info("=" * 60)
+        logger.info("Wrapping model with supervised routing capability")
+        logger.info(f"  - Routing loss weight: {args.routing_loss_weight}")
+        logger.info(f"  - Label embedding temperature: {args.label_embedding_temperature}")
+        logger.info(f"  - Dataset categories: {len(EXPERT_LABEL_MAP)} (factual, numerical, multi_hop, commonsense)")
+        logger.info(f"  - Model experts: {config.num_local_experts}")
+        logger.info("=" * 60)
 
-            model = convert_model_to_moe(model, num_experts=num_experts)
-        except Exception as e:
-            logger.error(f"MoE conversion failed: {e}")
-            logger.info("Continuing with original model architecture")
+        model = SupervisedMoEWrapper(
+            moe_model=model,
+            num_categories=4,  # factual, numerical, multi_hop, commonsense
+            num_experts=config.num_local_experts,  # Mixtral has 8 experts
+            routing_loss_weight=args.routing_loss_weight,
+            label_embedding_temperature=args.label_embedding_temperature,
+            router_aggregation="mean",  # Average router logits across all MoE layers
+        )
+        logger.info("Supervised routing wrapper initialized successfully")
+    else:
+        logger.info("Supervised routing disabled - using standard MoE training")
 
     # Load dataset
     logger.info(f"Loading dataset from {args.data_file}")
@@ -711,6 +678,8 @@ def flash_attn_func(*args, **kwargs):
     # Training loop
     logger.info("Starting training...")
     total_loss = 0.0
+    total_routing_loss = 0.0
+    routing_loss_count = 0  # Track number of routing losses logged
 
     for epoch in range(starting_epoch, args.epochs):
         model.train()
@@ -764,6 +733,9 @@ def flash_attn_func(*args, **kwargs):
                 outputs = model(**batch)
                 loss = outputs.loss
 
+                # Extract routing supervision loss if available (for monitoring)
+                routing_loss = getattr(outputs, 'routing_supervision_loss', None)
+
                 # Backward pass
                 accelerator.backward(loss)
 
@@ -782,6 +754,11 @@ def flash_attn_func(*args, **kwargs):
             # Accumulate loss
             total_loss += loss.detach().item()
             epoch_loss += loss.detach().item()
+
+            # Accumulate routing supervision loss if available
+            if routing_loss is not None:
+                total_routing_loss += routing_loss.detach().item()
+                routing_loss_count += 1
 
             if accelerator.sync_gradients:
                 global_step += 1
@@ -808,20 +785,37 @@ def flash_attn_func(*args, **kwargs):
                 if global_step % args.logging_steps == 0:
                     avg_loss = total_loss / args.logging_steps
 
-                    # Log metrics to TensorBoard
-                    accelerator.log({
+                    # Prepare metrics dictionary
+                    metrics = {
                         "train/loss": avg_loss,
                         "train/learning_rate": lr_scheduler.get_last_lr()[0],
                         "train/epoch": epoch,
                         "train/global_step": global_step,
-                    }, step=global_step)
+                    }
 
-                    logger.info(
+                    # Add routing supervision loss if available
+                    if routing_loss_count > 0:
+                        avg_routing_loss = total_routing_loss / routing_loss_count
+                        metrics["train/routing_supervision_loss"] = avg_routing_loss
+
+                    # Log metrics to TensorBoard
+                    accelerator.log(metrics, step=global_step)
+
+                    # Console logging
+                    log_str = (
                         f"Step {global_step}/{total_training_steps} | "
                         f"Loss: {avg_loss:.4f} | "
                         f"LR: {lr_scheduler.get_last_lr()[0]:.2e}"
                     )
+                    if routing_loss_count > 0:
+                        log_str += f" | Routing Loss: {avg_routing_loss:.4f}"
+
+                    logger.info(log_str)
+
+                    # Reset accumulators
                     total_loss = 0.0
+                    total_routing_loss = 0.0
+                    routing_loss_count = 0
 
                 # Save checkpoint
                 if global_step % args.save_steps == 0:
@@ -839,12 +833,14 @@ def flash_attn_func(*args, **kwargs):
                     )
 
                 # Update progress bar
-                progress_bar.set_postfix(
-                    {
-                        "loss": f"{loss.item():.4f}",
-                        "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
-                    }
-                )
+                postfix = {
+                    "loss": f"{loss.item():.4f}",
+                    "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
+                }
+                if routing_loss is not None:
+                    postfix["routing_loss"] = f"{routing_loss.item():.4f}"
+
+                progress_bar.set_postfix(postfix)
 
         # Close progress bar
         progress_bar.close()

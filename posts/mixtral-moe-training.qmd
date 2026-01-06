@@ -1,34 +1,38 @@
 ---
-title: "MPT MoE Training"
+title: "Mixtral-8x7B MoE Training with Supervised Routing"
 author: "Vijay Venkatraman"
-date: "2025-11-25"
-categories: [deep learning, training, mixture of experts, mpt-7b]
+date: "2026-01-06"
+categories: [deep learning, training, mixture of experts, mixtral, supervised routing]
 image: "thumbnail.png"
-description: "Train MPT-7B Mixture of Experts (MoE) models using HuggingFace Transformers, Accelerate, and DeepSpeed on multi-GPU systems"
+description: "Train Mixtral-8x7B Mixture of Experts models with supervised routing using HuggingFace Transformers, Accelerate, and DeepSpeed on multi-GPU systems"
 ---
 
 ## Overview
 
-This project demonstrates training MPT-7B Mixture of Experts (MoE) models using HuggingFace Transformers, Accelerate, and DeepSpeed on multi-GPU systems.
+This project demonstrates **true MoE training** with Mixtral-8x7B using supervised routing based on dataset expert labels. Unlike standard approaches, this implementation leverages expert annotations to guide routing decisions during training.
 
 **Key Specifications:**
 
-- **Model**: MPT-7B (mosaicml/mpt-7b)
-- **Dataset**: Natural Questions (NQ Open) - 87,925 Q&A pairs
+- **Model**: Mixtral-8x7B-v0.1 (mistralai/Mixtral-8x7B-v0.1) - 46.7B parameters, 13B active per forward pass
+- **Architecture**: Native MoE with 8 experts, Top-2 routing
+- **Dataset**: Natural Questions (NQ) with expert annotations - 87,925 Q&A pairs
 - **Hardware**: 2x NVIDIA H100 80GB GPUs
-- **Training Framework**: DeepSpeed ZeRO Stage 2 with HuggingFace Accelerate
-- **Expert Configuration**: 4 experts (factual_lookup, numerical_reasoning, multi_hop_reasoning, commonsense_reasoning)
-- **Training Time**: ~2-2.5 hours per epoch (optimized)
+- **Training Framework**: DeepSpeed ZeRO-2 with HuggingFace Accelerate
+- **Innovation**: Supervised routing with learnable 4→8 expert mapping
+- **Training Time**: ~8-10 hours per epoch
 
 ## Features
 
+- **True MoE Architecture**: Native Mixtral-8x7B with 8 experts and Top-2 routing
+- **Supervised Routing**: Soft guidance using dataset expert labels with KL divergence loss
+- **Learnable Mapping**: 4 dataset categories → 8 model experts (discovered during training)
+- **Load Balancing**: Auxiliary loss for balanced expert utilization
 - Multi-GPU distributed training using HuggingFace Accelerate
-- DeepSpeed ZeRO Stage 2 optimization for optimal speed/memory balance
+- DeepSpeed ZeRO-2 optimization for 46B parameter model
 - Mixed precision training (BF16)
 - Natural Questions dataset with expert routing annotations
-- Automatic checkpointing and resume
-- Gradient accumulation and clipping
-- Comprehensive logging and monitoring
+- Automatic checkpointing and resume capability
+- Comprehensive logging and monitoring with TensorBoard
 - Optimized for H100 GPUs
 
 ## Requirements
@@ -91,13 +95,13 @@ num_processes: 4  # Change to your GPU count
 
 ### DeepSpeed Config (`deepspeed_moe_config.json`)
 
-**Current Optimized Configuration (ZeRO Stage 2):**
+**Current Optimized Configuration (ZeRO Stage 2 for Mixtral-8x7B):**
 
 ```json
 {
-  "train_batch_size": 32,
-  "train_micro_batch_size_per_gpu": 4,
-  "gradient_accumulation_steps": 4,
+  "train_batch_size": 16,
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": 8,
   "zero_optimization": {
     "stage": 2,
     "offload_optimizer": {"device": "none"},
@@ -107,8 +111,10 @@ num_processes: 4  # Change to your GPU count
   "bf16": {"enabled": true},
   "moe": {
     "enabled": true,
-    "num_experts": 4,
-    "top_k": 1
+    "num_experts": 8,
+    "expert_capacity_factor": 1.25,
+    "top_k": 2,
+    "expert_parallel_size": 2
   }
 }
 ```
@@ -118,30 +124,34 @@ num_processes: 4  # Change to your GPU count
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | **ZeRO Stage** | 2 | Shards optimizer + gradients across GPUs (no CPU offload) |
-| **Micro batch per GPU** | 4 | Actual batch size loaded per GPU |
-| **Gradient accumulation** | 4 | Accumulate over 4 steps before optimizer update |
-| **Effective batch size** | 32 | 2 GPUs × 4 micro batch × 4 accumulation |
+| **Micro batch per GPU** | 1 | Mixtral is large (46B params) |
+| **Gradient accumulation** | 8 | Accumulate over 8 steps before optimizer update |
+| **Effective batch size** | 16 | 2 GPUs × 1 micro batch × 8 accumulation |
 | **Sequence length** | 256 | Maximum token length (set via --max_seq_length) |
 | **Precision** | bfloat16 | Better numerical stability than fp16 |
+| **Num experts** | 8 | Native Mixtral architecture |
+| **Top-K routing** | 2 | Each token uses 2 experts |
+| **Expert parallelism** | 2 | 4 experts per GPU |
 
 ## Training
 
 ### Basic Training
 
 ```bash
-accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py
+accelerate launch --config_file accelerate_config.yaml train_mixtral_8x7b_moe_accelerate.py
 ```
 
 ### Training with Custom Options
 
 ```bash
-accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py \
-    --model_id mosaicml/mpt-7b \
+accelerate launch --config_file accelerate_config.yaml train_mixtral_8x7b_moe_accelerate.py \
+    --model_id mistralai/Mixtral-8x7B-v0.1 \
     --data_file nq_annotated_moe.jsonl \
-    --output_dir ./mpt7b_moe_checkpoints \
+    --output_dir ./mixtral_moe_supervised \
     --epochs 3 \
-    --learning_rate 2e-5 \
-    --max_seq_length 512 \
+    --learning_rate 1e-5 \
+    --max_seq_length 256 \
+    --routing_loss_weight 0.1 \
     --per_device_batch_size 1 \
     --gradient_accumulation_steps 8 \
     --logging_steps 10 \
@@ -152,8 +162,9 @@ accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerat
 
 ```bash
 # Model settings
---model_id                     HuggingFace model ID (default: mosaicml/mpt-7b)
---convert_to_moe               Attempt to convert model to MoE (experimental)
+--model_id                     HuggingFace model ID (default: mistralai/Mixtral-8x7B-v0.1)
+--routing_loss_weight          Routing supervision strength (default: 0.1, range: 0.05-0.5)
+--disable_supervised_routing   Disable supervised routing (baseline mode)
 
 # Data settings
 --data_file                    Path to JSONL dataset (default: nq_annotated_moe.jsonl)
@@ -162,15 +173,15 @@ accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerat
 --max_target_length           Maximum target length (default: 128)
 
 # Training settings
---epochs                       Number of epochs (default: 1)
---learning_rate               Learning rate (default: 2e-5)
+--epochs                       Number of epochs (default: 3)
+--learning_rate               Learning rate (default: 1e-5)
 --per_device_batch_size       Batch size per GPU (default: 1)
 --gradient_accumulation_steps Gradient accumulation (default: 8)
---warmup_steps                Warmup steps (default: 100)
+--warmup_steps                Warmup steps (default: 200)
 --max_grad_norm               Max gradient norm (default: 1.0)
 
 # Logging and checkpointing
---output_dir                  Output directory (default: ./mpt7b_moe_finetune)
+--output_dir                  Output directory (default: ./mixtral_moe_supervised)
 --logging_steps               Log every N steps (default: 10)
 --save_steps                  Save every N steps (default: 500)
 
@@ -183,7 +194,7 @@ accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerat
 Test with limited samples:
 
 ```bash
-accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py \
+accelerate launch --config_file accelerate_config.yaml train_mixtral_8x7b_moe_accelerate.py \
     --max_samples 100 \
     --epochs 1 \
     --save_steps 50
@@ -194,7 +205,7 @@ accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerat
 ### TensorBoard
 
 ```bash
-tensorboard --logdir ./mpt7b_moe_finetune
+tensorboard --logdir ./mixtral_moe_supervised
 ```
 
 ### GPU Monitoring
@@ -206,11 +217,11 @@ watch -n 1 nvidia-smi
 
 ## Checkpoints
 
-Checkpoints are saved to `{output_dir}/checkpoint-{step|epoch}-{N}/`:
+Checkpoints are saved to `{output_dir}/checkpoint-{N}/` and `{output_dir}/checkpoint-epoch-{N}/`:
 
 ```
-mpt7b_moe_finetune/
-├── checkpoint-step-500/
+mixtral_moe_supervised/
+├── checkpoint-500/
 │   ├── config.json
 │   ├── model.safetensors
 │   └── tokenizer files...
@@ -221,10 +232,10 @@ mpt7b_moe_finetune/
 ### Loading Checkpoints
 
 ```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import MixtralForCausalLM, AutoTokenizer
 
-model = AutoModelForCausalLM.from_pretrained("./mpt7b_moe_finetune/checkpoint-epoch-1")
-tokenizer = AutoTokenizer.from_pretrained("./mpt7b_moe_finetune/checkpoint-epoch-1")
+model = MixtralForCausalLM.from_pretrained("./mixtral_moe_supervised/checkpoint-epoch-1")
+tokenizer = AutoTokenizer.from_pretrained("./mixtral_moe_supervised/checkpoint-epoch-1")
 ```
 
 ## Configuration Optimization Journey
@@ -287,15 +298,17 @@ Process has 70.15 GiB in use (62.03 GiB by PyTorch)
 - **Training Time**: ~2-2.5 hours per epoch (3x faster)
 - **Total iterations**: ~10,990 optimizer steps per epoch
 
-### Memory Usage Breakdown
+### Memory Usage Breakdown (Mixtral-8x7B)
 
 | Component | Size (BF16) | ZeRO-2 (per GPU) | ZeRO-3 w/ CPU offload |
 |-----------|-------------|------------------|-----------------------|
-| **Model Parameters** | ~14 GB | 7 GB (sharded) | ~0 GB (on CPU) |
-| **Gradients** | ~14 GB | 7 GB (sharded) | 7 GB (sharded) |
-| **Optimizer States** | ~28 GB | 14 GB (sharded) | ~0 GB (on CPU) |
-| **Activations (batch=4, seq=256)** | ~10-15 GB | 10-15 GB | 10-15 GB |
-| **TOTAL** | - | **~38-43 GB** | **~17-22 GB** |
+| **Model Parameters** | ~90 GB | ~45 GB (sharded) | ~0 GB (on CPU) |
+| **Gradients** | ~90 GB | ~45 GB (sharded) | ~45 GB (sharded) |
+| **Optimizer States** | ~180 GB | ~90 GB (sharded) | ~0 GB (on CPU) |
+| **Activations (batch=1, seq=256)** | ~20 GB | ~20 GB | ~20 GB |
+| **TOTAL** | - | **~50-60 GB** | **~65 GB** |
+
+**Note**: With Top-2 routing, only 2/8 experts are active per forward pass, reducing effective compute and memory for activations.
 
 ## Understanding Training Metrics
 
@@ -425,13 +438,16 @@ If training is too slow:
 
 ```
 .
-├── train_mpt7b_moe_accelerate.py  # Main training script
-├── prepare_dataset.py              # Dataset annotation with expert labels
+├── train_mixtral_8x7b_moe_accelerate.py  # Main training script
+├── supervised_routing.py          # MoE routing module with supervised routing
+├── prepare_dataset.py             # Dataset annotation with expert labels
+├── test_model_loading.py          # Unit test: model loading
+├── test_supervised_routing.py     # Unit test: routing module
 ├── accelerate_config.yaml         # Accelerate distributed config (2 GPUs)
-├── deepspeed_moe_config.json      # DeepSpeed ZeRO Stage 2 config
+├── deepspeed_moe_config.json      # DeepSpeed ZeRO-2 config (8 experts, Top-2)
 ├── nq_annotated_moe.jsonl         # Annotated NQ dataset (87,925 samples)
-├── mpt7b_moe_finetune/            # Output directory (checkpoints)
-└── README.md                      # This file (comprehensive guide)
+├── mixtral_moe_supervised/        # Output directory (checkpoints)
+└── README.md                      # Comprehensive guide
 ```
 
 ## Dataset Preparation
@@ -453,14 +469,14 @@ The expert labels are used for MoE routing during training.
 
 ## Citation
 
-If you use MPT models, please cite:
+If you use Mixtral models, please cite:
 
 ```bibtex
-@software{mpt-7b,
-  author = {MosaicML},
-  title = {MPT-7B},
-  year = {2023},
-  url = {https://huggingface.co/mosaicml/mpt-7b}
+@article{jiang2024mixtral,
+  title={Mixtral of Experts},
+  author={Jiang, Albert Q and Sablayrolles, Alexandre and Roux, Antoine and Mensch, Arthur and Savary, Blanche and Bamford, Chris and Chaplot, Devendra Singh and Casas, Diego de las and Hanna, Emma Bou and Bressand, Florian and others},
+  journal={arXiv preprint arXiv:2401.04088},
+  year={2024}
 }
 ```
 
@@ -468,10 +484,10 @@ If you use MPT models, please cite:
 
 This training code is provided as-is. Please refer to the respective licenses of:
 
-- HuggingFace Transformers
-- DeepSpeed
-- Accelerate
-- MPT models (Apache 2.0)
+- HuggingFace Transformers (Apache 2.0)
+- DeepSpeed (MIT)
+- Accelerate (Apache 2.0)
+- Mixtral models (Apache 2.0)
 
 ## Quick Reference
 
@@ -481,26 +497,31 @@ This training code is provided as-is. Please refer to the respective licenses of
 # Hardware
 2x NVIDIA H100 80GB GPUs
 
+# Model
+Model: Mixtral-8x7B-v0.1 (46.7B params)
+Architecture: 8 experts, Top-2 routing
+Active params per forward: ~13B (2/8 experts)
+
 # Configuration
 ZeRO Stage: 2 (no CPU offload)
-Micro batch per GPU: 4
-Gradient accumulation: 4
-Effective batch size: 32
+Micro batch per GPU: 1
+Gradient accumulation: 8
+Effective batch size: 16
 Sequence length: 256
 Precision: bfloat16
+Supervised routing: Enabled (weight: 0.1)
 
 # Performance
-GPU memory usage: ~40-50 GB per GPU
-Training speed: ~2-3 it/s
-Training time: ~2-2.5 hours per epoch
-Total optimizer steps: ~10,991 per epoch
+GPU memory usage: ~50-60 GB per GPU
+Training speed: ~0.5-1.0 it/s
+Training time: ~8-10 hours per epoch
 ```
 
 ### Common Commands
 
 ```bash
 # Start training
-accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py
+accelerate launch --config_file accelerate_config.yaml train_mixtral_8x7b_moe_accelerate.py
 
 # Monitor GPUs
 watch -n 2 nvidia-smi
@@ -509,19 +530,23 @@ watch -n 2 nvidia-smi
 tail -f nohup.out | grep "Step.*Loss"
 
 # Kill training
-pkill -f train_mpt7b_moe_accelerate.py
+pkill -f train_mixtral_8x7b_moe_accelerate.py
 ```
 
 ### Configuration at a Glance
 
 | What | Current Value | Where to Change |
 |------|---------------|-----------------|
+| Model | Mixtral-8x7B-v0.1 | Command line: `--model_id` |
+| Num experts | 8 | `deepspeed_moe_config.json` → `moe.num_experts` |
+| Top-K routing | 2 | `deepspeed_moe_config.json` → `moe.top_k` |
 | ZeRO Stage | 2 | `deepspeed_moe_config.json` → `zero_optimization.stage` |
-| Micro batch size | 4 | `deepspeed_moe_config.json` → `train_micro_batch_size_per_gpu` |
-| Gradient accumulation | 4 | `deepspeed_moe_config.json` → `gradient_accumulation_steps` |
+| Micro batch size | 1 | `deepspeed_moe_config.json` → `train_micro_batch_size_per_gpu` |
+| Gradient accumulation | 8 | `deepspeed_moe_config.json` → `gradient_accumulation_steps` |
 | Sequence length | 256 | Command line: `--max_seq_length 256` |
+| Routing weight | 0.1 | Command line: `--routing_loss_weight 0.1` |
 | Number of GPUs | 2 | `accelerate_config.yaml` → `num_processes` |
-| Learning rate | 2e-5 | Command line: `--learning_rate 2e-5` |
+| Learning rate | 1e-5 | Command line: `--learning_rate 1e-5` |
 
 ## Support
 
@@ -529,4 +554,4 @@ For issues:
 
 - HuggingFace Accelerate: https://github.com/huggingface/accelerate
 - DeepSpeed: https://github.com/microsoft/DeepSpeed
-- MPT Models: https://huggingface.co/mosaicml
+- Mixtral Models: https://huggingface.co/mistralai/Mixtral-8x7B-v0.1

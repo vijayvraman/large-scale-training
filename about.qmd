@@ -38,6 +38,6 @@ This work builds upon excellent tools and frameworks:
 - [HuggingFace Transformers](https://github.com/huggingface/transformers)
 - [HuggingFace Accelerate](https://github.com/huggingface/accelerate)
 - [Microsoft DeepSpeed](https://github.com/microsoft/DeepSpeed)
-- [MosaicML MPT Models](https://huggingface.co/mosaicml)
+- [Mistral AI Mixtral Models](https://huggingface.co/mistralai)
 - [PyTorch FSDP](https://pytorch.org/docs/stable/fsdp.html)
 - [TorchTitan](https://github.com/pytorch/torchtitan)

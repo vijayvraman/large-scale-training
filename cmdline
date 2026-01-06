@@ -1,12 +1,12 @@
 # Uncomment as needed and source this file
 
-nohup env PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py 2>&1 | TZ=America/Los_Angeles ts '[%Y-%m-%d %H:%M:%S %Z]' | tr '\r' '\n' > nohup.out &
+nohup env PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --config_file accelerate_config.yaml train_mixtral_8x7b_moe_accelerate.py 2>&1 | TZ=America/Los_Angeles ts '[%Y-%m-%d %H:%M:%S %Z]' | tr '\r' '\n' > nohup.out &
 
 #resume training (update checkpoint number as needed)
-#nohup env PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --config_file accelerate_config.yaml train_mpt7b_moe_accelerate.py --resume_from_checkpoint ./mpt7b_moe_finetune/checkpoint-step-2000 2>&1 | TZ=America/Los_Angeles ts '[%Y-%m-%d %H:%M:%S %Z]' | tr '\r' '\n' > nohup.out &
+#nohup env PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --config_file accelerate_config.yaml train_mixtral_8x7b_moe_accelerate.py --resume_from_checkpoint ./mixtral_moe_supervised/checkpoint-500 2>&1 | TZ=America/Los_Angeles ts '[%Y-%m-%d %H:%M:%S %Z]' | tr '\r' '\n' > nohup.out &
 
 # Replace checkpoint number with epoch
-#python upload_to_hub.py       --model_path ./mpt7b_moe_finetune/checkpoint-epoch-2       --repo_name vvijayk/mpt-7b-moe-nq-finetuned
+#python upload_to_hub.py --model_path ./mixtral_moe_supervised/checkpoint-epoch-1 --repo_name vvijayk/mixtral-8x7b-moe-nq-finetuned
 
 # Tensorboard
-# tensorboard --logdir mpt7b_moe_finetune/mpt7b_moe_training --bind_all
+# tensorboard --logdir mixtral_moe_supervised --bind_all

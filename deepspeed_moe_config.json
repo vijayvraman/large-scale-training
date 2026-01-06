@@ -1,5 +1,5 @@
 {
-  "train_micro_batch_size_per_gpu": 4,
+  "train_micro_batch_size_per_gpu": 1,
   "gradient_accumulation_steps": 8,
   "steps_per_print": 100,
   "zero_optimization": {
@@ -17,9 +17,10 @@
   },
   "moe": {
     "enabled": true,
-    "num_experts": 4,
-    "expert_capacity_factor": 1.0,
-    "top_k": 1,
+    "num_experts": 8,
+    "expert_capacity_factor": 1.25,
+    "top_k": 2,
+    "expert_parallel_size": 2,
     "use_force_gating": false,
     "combine_experts": false
   }
