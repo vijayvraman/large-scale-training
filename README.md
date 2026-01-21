@@ -27,6 +27,7 @@ This project implements **true MoE training** with **supervised routing** for Mi
 - ✅ DeepSpeed ZeRO-2 optimization
 - ✅ Mixed precision (BF16) training
 - ✅ Gradient checkpointing for memory efficiency
+- ✅ Cosine annealing learning rate schedule with warmup
 - ✅ Comprehensive logging (TensorBoard + console)
 - ✅ Resumable training with full state preservation
 
@@ -427,6 +428,41 @@ load_balance_loss = sum(me * ce) * num_experts
 ```
 
 Combined with routing supervision, this creates balanced expert specialization.
+
+### Cosine Annealing Learning Rate Schedule
+
+The training uses cosine annealing with warmup for the learning rate schedule:
+
+```python
+lr_scheduler = get_cosine_schedule_with_warmup(
+    optimizer=optimizer,
+    num_warmup_steps=warmup_steps,
+    num_training_steps=total_training_steps,
+)
+```
+
+**How it works:**
+
+1. **Warmup Phase**: Learning rate increases linearly from 0 to the specified `--lr` value over the first warmup steps
+2. **Cosine Decay**: After warmup, the learning rate follows a cosine curve, gradually decreasing to near-zero
+3. **Smoother Convergence**: Unlike linear decay, cosine annealing stays at higher learning rates longer, then decays more smoothly
+
+**Benefits:**
+- Better convergence compared to constant or linear decay
+- Helps escape local minima during training
+- Reduces risk of overfitting toward the end of training
+- More stable training for large models like Mixtral
+
+**Configuration:**
+
+The warmup steps default to 10% of total training steps but can be adjusted:
+
+```bash
+# Custom warmup (via code modification)
+# Default: warmup_steps = total_steps // 10
+```
+
+The learning rate schedule is automatically saved and restored when resuming from checkpoints, ensuring training continuity.
 
 ## 📊 Performance Comparison
 

@@ -27,6 +27,7 @@ This project demonstrates **true MoE training** with Mixtral-8x7B using supervis
 - **Supervised Routing**: Soft guidance using dataset expert labels with KL divergence loss
 - **Learnable Mapping**: 4 dataset categories → 8 model experts (discovered during training)
 - **Load Balancing**: Auxiliary loss for balanced expert utilization
+- **Cosine Annealing**: Learning rate schedule with warmup for better convergence
 - Multi-GPU distributed training using HuggingFace Accelerate
 - DeepSpeed ZeRO-2 optimization for 46B parameter model
 - Mixed precision training (BF16)
@@ -466,6 +467,48 @@ This creates `nq_annotated_moe.jsonl` with 4 expert types:
 - **commonsense_reasoning** (why/reason/cause questions)
 
 The expert labels are used for MoE routing during training.
+
+## Learning Rate Schedule: Cosine Annealing
+
+The training uses cosine annealing with warmup for the learning rate schedule:
+
+```python
+lr_scheduler = get_cosine_schedule_with_warmup(
+    optimizer=optimizer,
+    num_warmup_steps=warmup_steps,
+    num_training_steps=total_training_steps,
+)
+```
+
+### How It Works
+
+1. **Warmup Phase**: Learning rate increases linearly from 0 to the specified `--learning_rate` value over the first warmup steps (default: 10% of total steps)
+2. **Cosine Decay**: After warmup, the learning rate follows a cosine curve, gradually decreasing to near-zero
+3. **Smoother Convergence**: Unlike linear decay, cosine annealing stays at higher learning rates longer, then decays more smoothly
+
+### Benefits
+
+- Better convergence compared to constant or linear decay
+- Helps escape local minima during training
+- Reduces risk of overfitting toward the end of training
+- More stable training for large models like Mixtral
+- The schedule is automatically saved and restored when resuming from checkpoints
+
+### Visualization
+
+The learning rate follows this pattern over training:
+
+```
+LR
+^
+|     /‾‾‾‾‾‾‾‾⌝
+|    /          \_
+|   /             \__
+|  /                 \___
+| /                      \_____
+|/____________________________\_
+0        warmup         total steps
+```
 
 ## Citation
 
