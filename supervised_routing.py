@@ -344,7 +344,10 @@ def get_expert_utilization_stats(
 
     # Compute statistics
     total_assignments = expert_counts.sum()
-    expert_percentages = (expert_counts / total_assignments.clamp(min=1)) * 100
+    # Calculate percentage of tokens that route to each expert
+    # Since each token routes to top_k experts, divide by number of valid tokens
+    num_valid_tokens = total_assignments / top_k
+    expert_percentages = (expert_counts / num_valid_tokens.clamp(min=1)) * 100
 
     stats = {
         "expert_counts": expert_counts.cpu().tolist(),

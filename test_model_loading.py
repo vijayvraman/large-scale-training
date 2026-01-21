@@ -25,6 +25,9 @@ def test_mixtral_loading():
     print("\n[Test 1] Loading tokenizer...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        # Set pad_token to eos_token if not already set
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         print(f"✓ Tokenizer loaded successfully")
         print(f"  - Vocab size: {len(tokenizer)}")
         print(f"  - BOS token: {tokenizer.bos_token}")

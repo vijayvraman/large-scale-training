@@ -127,39 +127,83 @@ echo ""
 # Check if required files exist
 echo "Checking configuration files..."
 
-if [ -f "deepspeed_moe_config.json" ]; then
-    print_status 0 "deepspeed_moe_config.json exists"
+# Check for DeepSpeed config files (stage 2 and stage 3)
+FOUND_DEEPSPEED_CONFIG=false
+for config_file in "deepspeed_moe_config_stage2.json" "deepspeed_moe_config_stage3.json"; do
+    if [ -f "$config_file" ]; then
+        print_status 0 "$config_file exists"
+        FOUND_DEEPSPEED_CONFIG=true
 
-    # Validate JSON
-    python -c "import json; json.load(open('deepspeed_moe_config.json'))" 2>/dev/null
-    if [ $? -eq 0 ]; then
-        print_status 0 "deepspeed_moe_config.json is valid JSON"
+        # Validate JSON
+        python -c "import json; json.load(open('$config_file'))" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            print_status 0 "$config_file is valid JSON"
 
-        # Check key MoE settings
-        NUM_EXPERTS=$(python -c "import json; config=json.load(open('deepspeed_moe_config.json')); print(config['moe']['num_experts'])")
-        TOP_K=$(python -c "import json; config=json.load(open('deepspeed_moe_config.json')); print(config['moe']['top_k'])")
+            # Check key MoE settings
+            NUM_EXPERTS=$(python -c "import json; config=json.load(open('$config_file')); print(config['moe']['num_experts'])")
+            TOP_K=$(python -c "import json; config=json.load(open('$config_file')); print(config['moe']['top_k'])")
+            ZERO_STAGE=$(python -c "import json; config=json.load(open('$config_file')); print(config['zero_optimization']['stage'])")
 
-        echo "  - num_experts: $NUM_EXPERTS (expected: 8)"
-        echo "  - top_k: $TOP_K (expected: 2)"
+            echo "  - num_experts: $NUM_EXPERTS (expected: 8)"
+            echo "  - top_k: $TOP_K (expected: 2)"
+            echo "  - ZeRO stage: $ZERO_STAGE"
 
-        if [ "$NUM_EXPERTS" = "8" ] && [ "$TOP_K" = "2" ]; then
-            print_status 0 "MoE configuration correct"
-            TESTS_PASSED=$((TESTS_PASSED + 1))
+            if [ "$NUM_EXPERTS" = "8" ] && [ "$TOP_K" = "2" ]; then
+                print_status 0 "MoE configuration correct in $config_file"
+            else
+                print_status 1 "MoE configuration incorrect in $config_file"
+                TESTS_FAILED=$((TESTS_FAILED + 1))
+            fi
         else
-            print_status 1 "MoE configuration incorrect"
+            print_status 1 "$config_file is invalid JSON"
             TESTS_FAILED=$((TESTS_FAILED + 1))
         fi
-    else
-        print_status 1 "deepspeed_moe_config.json is invalid JSON"
-        TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
+done
+
+if [ "$FOUND_DEEPSPEED_CONFIG" = true ]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
 else
-    print_status 1 "deepspeed_moe_config.json not found"
+    print_status 1 "No DeepSpeed config files found (expected deepspeed_moe_config_stage2.json or deepspeed_moe_config_stage3.json)"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
 if [ -f "accelerate_config.yaml" ]; then
     print_status 0 "accelerate_config.yaml exists"
+
+    # Update accelerate_config.yaml with detected GPU count
+    NUM_GPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
+    if [ "$NUM_GPUS" -gt 0 ]; then
+        sed -i "s/^num_processes: .*/num_processes: $NUM_GPUS/" accelerate_config.yaml
+        print_status 0 "Updated accelerate_config.yaml to use $NUM_GPUS processes"
+
+        # Detect GPU memory and choose appropriate DeepSpeed config
+        GPU_MEMORY=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+        TOTAL_GPU_MEMORY=$((NUM_GPUS * GPU_MEMORY))
+
+        # For Mixtral-8x7B (46.7B params ~93GB in bf16):
+        # - Stage 2: Full model on each GPU (needs ~100GB+ per GPU)
+        # - Stage 3: Model sharded across GPUs + CPU offload (works with 2x80GB)
+        # Use stage 3 if we have less than 100GB per GPU or total memory < 300GB
+        if [ "$GPU_MEMORY" -lt 100000 ] || [ "$TOTAL_GPU_MEMORY" -lt 300000 ]; then
+            DEEPSPEED_CONFIG="deepspeed_moe_config_stage3.json"
+            ZERO3_FLAG="true"
+            echo "  - Detected ${NUM_GPUS}x GPUs with ${GPU_MEMORY}MB each (total: ${TOTAL_GPU_MEMORY}MB)"
+            echo "  - Using ZeRO Stage 3 with CPU offloading for large model support"
+        else
+            DEEPSPEED_CONFIG="deepspeed_moe_config_stage2.json"
+            ZERO3_FLAG="false"
+            echo "  - Detected ${NUM_GPUS}x GPUs with ${GPU_MEMORY}MB each (total: ${TOTAL_GPU_MEMORY}MB)"
+            echo "  - Using ZeRO Stage 2 (sufficient GPU memory available)"
+        fi
+
+        # Update accelerate config with appropriate DeepSpeed config
+        sed -i "s|deepspeed_config_file: .*|deepspeed_config_file: $DEEPSPEED_CONFIG|" accelerate_config.yaml
+        sed -i "s/zero3_init_flag: .*/zero3_init_flag: $ZERO3_FLAG/" accelerate_config.yaml
+        print_status 0 "Updated accelerate_config.yaml to use $DEEPSPEED_CONFIG"
+    else
+        echo -e "${YELLOW}⚠ Could not detect GPUs with nvidia-smi${NC}"
+    fi
 else
     print_status 1 "accelerate_config.yaml not found"
     echo "  Note: Create with 'accelerate config' command"

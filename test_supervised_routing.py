@@ -10,7 +10,7 @@ Run:
 
 import torch
 import torch.nn as nn
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 import sys
 
 
@@ -42,7 +42,7 @@ def create_dummy_moe_model(batch_size=2, seq_len=10, num_experts=8, num_layers=4
                     for _ in range(self.num_layers)
                 ])
 
-            return CausalLMOutputWithPast(
+            return MoeCausalLMOutputWithPast(
                 loss=loss,
                 logits=logits,
                 router_logits=router_logits,

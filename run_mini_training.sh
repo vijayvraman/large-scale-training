@@ -62,14 +62,6 @@ echo "========================================="
 nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
 echo ""
 
-# Ask for confirmation
-read -p "Proceed with mini training? (y/n) " -n 1 -r
-echo ""
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Training cancelled."
-    exit 0
-fi
-
 echo ""
 echo "========================================="
 echo "Starting Training"
