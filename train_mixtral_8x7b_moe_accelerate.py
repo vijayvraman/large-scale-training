@@ -485,6 +485,7 @@ def main():
         args.model_id,
         output_router_logits=True,  # CRITICAL: Enable router logit output for supervised routing
         router_aux_loss_coef=0.01,  # Load balancing loss weight (alpha in loss equation)
+        use_cache=False,  # Required for gradient checkpointing (set explicitly to avoid warnings)
     )
     logger.info(f"Mixtral config loaded: {config.num_local_experts} experts, router_jitter_noise={config.router_jitter_noise}")
 
@@ -745,11 +746,12 @@ def main():
 
                 # Optimizer step
                 optimizer.step()
-                optimizer.zero_grad()
 
-            # Step scheduler only after gradients are synced (after accumulation)
-            if accelerator.sync_gradients:
-                lr_scheduler.step()
+                # Step scheduler after optimizer (only when actually stepping)
+                if accelerator.sync_gradients:
+                    lr_scheduler.step()
+
+                optimizer.zero_grad()
 
             # Accumulate loss
             total_loss += loss.detach().item()

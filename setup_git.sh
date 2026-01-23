@@ -3,6 +3,10 @@
 ssh-keygen
 
 #Add ~/.ssh/id_rsa.pub to Settings->Deploy Keys in Github repo
+cat ~/.ssh/id_rsa.pub
+echo "Add above key to Github repo Settings->Deploy Keys"
+echo -n "Press Enter when done"
+read
 
 #Test connection
 ssh -T git@github.com

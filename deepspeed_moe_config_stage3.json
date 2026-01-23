@@ -1,6 +1,6 @@
 {
   "train_micro_batch_size_per_gpu": 1,
-  "gradient_accumulation_steps": 8,
+  "gradient_accumulation_steps": 16,
   "steps_per_print": 100,
   "zero_optimization": {
     "stage": 3,
@@ -14,23 +14,32 @@
     },
     "overlap_comm": true,
     "contiguous_gradients": true,
-    "reduce_bucket_size": 50000000.0,
-    "allgather_bucket_size": 50000000.0,
-    "stage3_prefetch_bucket_size": 50000000.0,
-    "stage3_param_persistence_threshold": 1000000,
-    "stage3_max_live_parameters": 1000000000,
-    "stage3_max_reuse_distance": 1000000000,
-    "sub_group_size": 1000000000
+    "reduce_bucket_size": 10000000.0,
+    "allgather_bucket_size": 10000000.0,
+    "stage3_prefetch_bucket_size": 10000000.0,
+    "stage3_param_persistence_threshold": 100000,
+    "stage3_max_live_parameters": 500000000,
+    "stage3_max_reuse_distance": 500000000,
+    "stage3_gather_16bit_weights_on_model_save": true,
+    "sub_group_size": 500000000,
+    "round_robin_gradients": true
   },
   "bf16": {
     "enabled": true
   },
+  "gradient_clipping": 1.0,
+  "activation_checkpointing": {
+    "partition_activations": true,
+    "cpu_checkpointing": false,
+    "contiguous_memory_optimization": true,
+    "synchronize_checkpoint_boundary": false
+  },
   "moe": {
     "enabled": true,
     "num_experts": 8,
-    "expert_capacity_factor": 1.25,
+    "expert_capacity_factor": 1.0,
     "top_k": 2,
-    "expert_parallel_size": 2,
+    "expert_parallel_size": 4,
     "use_force_gating": false,
     "combine_experts": false
   }

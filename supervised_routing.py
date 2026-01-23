@@ -60,7 +60,10 @@ class ExpertLabelEmbedding(nn.Module):
             expert_prefs: [batch_size, num_experts] - Expert preference logits
         """
         # One-hot encode: [batch_size] -> [batch_size, num_categories]
-        one_hot = F.one_hot(label_ids, num_classes=self.num_categories).float()
+        # Match dtype of the linear layer to avoid dtype mismatch in mixed precision training
+        one_hot = F.one_hot(label_ids, num_classes=self.num_categories).to(
+            dtype=self.label_to_expert_prefs.weight.dtype
+        )
 
         # Project to expert preferences: [batch_size, num_categories] -> [batch_size, num_experts]
         expert_prefs = self.label_to_expert_prefs(one_hot)
@@ -92,6 +95,13 @@ def compute_routing_supervision_loss(
     Returns:
         loss: Scalar tensor (if reduction="mean" or "sum") or [batch, seq_len] (if "none")
     """
+    # Validate input shape
+    if router_logits.dim() != 3:
+        raise ValueError(
+            f"Expected router_logits to be 3D [batch, seq_len, num_experts], "
+            f"but got shape {router_logits.shape} with {router_logits.dim()} dimensions"
+        )
+
     batch_size, seq_len, num_experts = router_logits.shape
 
     # Expand expert preferences to all sequence positions
@@ -126,6 +136,7 @@ def compute_routing_supervision_loss(
 def aggregate_router_logits_across_layers(
     router_logits_tuple: Tuple[torch.Tensor, ...],
     aggregation: str = "mean",
+    batch_size: int = None,
 ) -> torch.Tensor:
     """
     Aggregate router logits from multiple MoE layers.
@@ -135,7 +146,9 @@ def aggregate_router_logits_across_layers(
 
     Args:
         router_logits_tuple: Tuple of [batch, seq_len, num_experts] tensors
+                           or tuple of (router_logits, selected_experts) tuples
         aggregation: "mean", "sum", or "last"
+        batch_size: Batch size to use for reshaping if router_logits are 2D
 
     Returns:
         aggregated: [batch, seq_len, num_experts]
@@ -143,12 +156,38 @@ def aggregate_router_logits_across_layers(
     if not router_logits_tuple or len(router_logits_tuple) == 0:
         raise ValueError("router_logits_tuple is empty")
 
+    # Handle new transformers format where router_logits is a tuple of tuples
+    # Each element is (router_logits, selected_experts) - we only need router_logits
+    logits_list = []
+    for item in router_logits_tuple:
+        if isinstance(item, tuple):
+            # New format: (router_logits, selected_experts)
+            router_logit = item[0]
+        else:
+            # Old format: just router_logits tensor
+            router_logit = item
+
+        # Handle 2D router logits that are missing batch dimension
+        # Some versions return [seq_len * batch, num_experts] or [seq_len, num_experts]
+        if router_logit.dim() == 2 and batch_size is not None:
+            seq_len, num_experts = router_logit.shape
+            # Check if seq_len is divisible by batch_size
+            if seq_len % batch_size == 0:
+                # Reshape to [batch, seq_len/batch, num_experts]
+                tokens_per_sample = seq_len // batch_size
+                router_logit = router_logit.view(batch_size, tokens_per_sample, num_experts)
+            else:
+                # Unsqueeze to add batch dimension
+                router_logit = router_logit.unsqueeze(0)
+
+        logits_list.append(router_logit)
+
     if aggregation == "last":
-        return router_logits_tuple[-1]
+        return logits_list[-1]
     elif aggregation == "mean":
-        return torch.stack(router_logits_tuple, dim=0).mean(dim=0)
+        return torch.stack(logits_list, dim=0).mean(dim=0)
     elif aggregation == "sum":
-        return torch.stack(router_logits_tuple, dim=0).sum(dim=0)
+        return torch.stack(logits_list, dim=0).sum(dim=0)
     else:
         raise ValueError(f"Unknown aggregation: {aggregation}")
 
@@ -258,10 +297,14 @@ class SupervisedMoEWrapper(nn.Module):
             # Compute expert preferences from labels
             expert_prefs = self.expert_label_embedding(expert_label_ids)  # [batch, num_experts]
 
+            # Get batch size for potential reshaping
+            batch_size = input_ids.shape[0]
+
             # Aggregate router logits across layers
             aggregated_router_logits = aggregate_router_logits_across_layers(
                 router_logits,
                 aggregation=self.router_aggregation,
+                batch_size=batch_size,
             )
 
             # Compute routing supervision loss
@@ -325,7 +368,23 @@ def get_expert_utilization_stats(
     """
     # Handle tuple of router logits from multiple layers
     if isinstance(router_logits, tuple):
-        router_logits = aggregate_router_logits_across_layers(router_logits, aggregation="mean")
+        batch_size = attention_mask.shape[0]
+        router_logits = aggregate_router_logits_across_layers(
+            router_logits,
+            aggregation="mean",
+            batch_size=batch_size
+        )
+
+    # Ensure router_logits is a tensor (not a tuple)
+    if isinstance(router_logits, tuple):
+        router_logits = router_logits[0]
+
+    # Validate shape
+    if router_logits.dim() != 3:
+        raise ValueError(
+            f"Expected router_logits to be 3D [batch, seq_len, num_experts], "
+            f"but got shape {router_logits.shape} with {router_logits.dim()} dimensions"
+        )
 
     batch_size, seq_len, num_experts = router_logits.shape
 

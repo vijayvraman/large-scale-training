@@ -44,6 +44,7 @@ def test_mixtral_loading():
             model_id,
             output_router_logits=True,
             router_aux_loss_coef=0.01,
+            use_cache=False,  # Required for gradient checkpointing
         )
         print(f"✓ Config loaded successfully")
         print(f"  - Model type: {config.model_type}")

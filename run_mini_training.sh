@@ -27,7 +27,7 @@ DATA_FILE="nq_annotated_moe.jsonl"
 OUTPUT_DIR="./test_mixtral_supervised"
 MAX_SAMPLES=100
 EPOCHS=1
-MAX_SEQ_LENGTH=256
+MAX_SEQ_LENGTH=128
 ROUTING_LOSS_WEIGHT=0.1
 LEARNING_RATE=1e-5
 LOGGING_STEPS=5
@@ -54,6 +54,11 @@ echo ""
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
+
+# Set logfile path
+LOGFILE="$OUTPUT_DIR/training_$(date +%Y%m%d_%H%M%S).log"
+echo "Logfile: $LOGFILE"
+echo ""
 
 # Show GPU status
 echo "========================================="
@@ -98,7 +103,7 @@ Configuration:
 - Learning rate: $LEARNING_RATE
 EOF
 
-# Run training
+# Run training (output to both screen and logfile)
 accelerate launch --config_file accelerate_config.yaml \
   train_mixtral_8x7b_moe_accelerate.py \
   --model_id "$MODEL_ID" \
@@ -113,9 +118,9 @@ accelerate launch --config_file accelerate_config.yaml \
   --save_steps $SAVE_STEPS \
   --warmup_steps 20 \
   --per_device_batch_size 1 \
-  --gradient_accumulation_steps 8
+  --gradient_accumulation_steps 12 2>&1 | tee "$LOGFILE"
 
-TRAIN_EXIT_CODE=$?
+TRAIN_EXIT_CODE=${PIPESTATUS[0]}
 
 echo ""
 echo "========================================="
@@ -127,6 +132,7 @@ if [ $TRAIN_EXIT_CODE -eq 0 ]; then
     echo "✓ Mini training completed successfully!"
     echo ""
     echo "Output directory: $OUTPUT_DIR"
+    echo "Training log: $LOGFILE"
     echo ""
 
     # Show what was created
