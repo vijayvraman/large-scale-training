@@ -148,6 +148,33 @@ Combined Loss = LM + Load Balancing + Routing Supervision
 3. **Soft Guidance**: Encourages but doesn't force specific routing decisions
 4. **Learnable Mapping**: Model discovers optimal category-to-expert assignments
 
+### Category to Expert Mapping
+
+The system uses a **soft mapping** from 4 dataset categories to 8 model experts. This doesn't require a 1-to-1 correspondence:
+
+**Dataset categories: 4**
+- factual_lookup
+- numerical_reasoning
+- multi_hop_reasoning
+- commonsense_reasoning
+
+**Model experts: 8** (Mixtral 8x7B architecture)
+
+**How the mapping works:**
+
+1. **ExpertLabelEmbedding** creates learnable embeddings that map 4 categories → 8 experts
+2. Multiple experts can specialize in the same category
+3. Example learned specialization:
+   - Experts 0, 1, 2 might handle factual_lookup
+   - Experts 3, 4 might handle numerical_reasoning
+   - Experts 5, 6 might handle multi_hop_reasoning
+   - Expert 7 might handle commonsense_reasoning
+
+**Benefits:**
+- **Flexibility**: Multiple experts can be assigned to complex categories
+- **Fine-grained specialization**: Different experts within a category can sub-specialize
+- **Routing efficiency**: The model uses top_k=2 (routes to 2 experts per token), and the supervised loss guides it toward category-appropriate experts
+
 ### Expert Categories
 
 | Category | Examples | Purpose |

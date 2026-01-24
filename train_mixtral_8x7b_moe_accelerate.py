@@ -94,7 +94,7 @@ def parse_args():
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=256,
+        default=64,
         help="Maximum sequence length for input"
     )
     parser.add_argument(
@@ -118,13 +118,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_batch_size",
         type=int,
-        default=1,
+        default=2,
         help="Batch size per GPU (micro batch)"
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=8,
+        default=6,
         help="Number of gradient accumulation steps"
     )
     parser.add_argument(

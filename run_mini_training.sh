@@ -91,8 +91,8 @@ accelerate launch --config_file accelerate_config.yaml \\
   --logging_steps $LOGGING_STEPS \\
   --save_steps $SAVE_STEPS \\
   --warmup_steps 20 \\
-  --per_device_batch_size 1 \\
-  --gradient_accumulation_steps 8
+  --per_device_batch_size 2 \\
+  --gradient_accumulation_steps 6
 
 Configuration:
 - Model: $MODEL_ID
@@ -117,8 +117,8 @@ accelerate launch --config_file accelerate_config.yaml \
   --logging_steps $LOGGING_STEPS \
   --save_steps $SAVE_STEPS \
   --warmup_steps 20 \
-  --per_device_batch_size 1 \
-  --gradient_accumulation_steps 12 2>&1 | tee "$LOGFILE"
+  --per_device_batch_size 2 \
+  --gradient_accumulation_steps 6 2>&1 | tee "$LOGFILE"
 
 TRAIN_EXIT_CODE=${PIPESTATUS[0]}
 
