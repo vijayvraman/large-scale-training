@@ -27,7 +27,7 @@ DATA_FILE="nq_annotated_moe.jsonl"
 OUTPUT_DIR="./test_mixtral_supervised"
 MAX_SAMPLES=100
 EPOCHS=1
-MAX_SEQ_LENGTH=128
+MAX_SEQ_LENGTH=64
 ROUTING_LOSS_WEIGHT=0.1
 LEARNING_RATE=1e-5
 LOGGING_STEPS=5
@@ -91,8 +91,8 @@ accelerate launch --config_file accelerate_config.yaml \\
   --logging_steps $LOGGING_STEPS \\
   --save_steps $SAVE_STEPS \\
   --warmup_steps 20 \\
-  --per_device_batch_size 2 \\
-  --gradient_accumulation_steps 6
+  --per_device_batch_size 1 \\
+  --gradient_accumulation_steps 8
 
 Configuration:
 - Model: $MODEL_ID
@@ -117,8 +117,8 @@ accelerate launch --config_file accelerate_config.yaml \
   --logging_steps $LOGGING_STEPS \
   --save_steps $SAVE_STEPS \
   --warmup_steps 20 \
-  --per_device_batch_size 2 \
-  --gradient_accumulation_steps 6 2>&1 | tee "$LOGFILE"
+  --per_device_batch_size 1 \
+  --gradient_accumulation_steps 8 2>&1 | tee "$LOGFILE"
 
 TRAIN_EXIT_CODE=${PIPESTATUS[0]}
 

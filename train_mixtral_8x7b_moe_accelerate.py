@@ -656,7 +656,11 @@ def main():
             starting_epoch = loaded_epoch
             steps_in_current_epoch = global_step - (starting_epoch * num_update_steps_per_epoch)
         logger.info(f"Resuming from epoch {starting_epoch}, global_step {global_step}, steps_in_current_epoch {steps_in_current_epoch}")
-        logger.info(f"Resumed learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
+        # Note: get_last_lr() is safe here after loading checkpoint state
+        try:
+            logger.info(f"Resumed learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
+        except:
+            logger.info(f"Resumed learning rate: {args.learning_rate:.2e} (scheduler state not available)")
 
     logger.info("=" * 50)
     logger.info(f"Total examples: {len(train_dataset)}")
@@ -740,17 +744,15 @@ def main():
                 # Backward pass
                 accelerator.backward(loss)
 
-                # Gradient clipping
+                # Gradient clipping (only when gradients sync)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
-                # Optimizer step
+                # Optimizer and scheduler steps
+                # Both are called unconditionally - Accelerate's accumulate() context
+                # automatically makes them no-ops during accumulation steps
                 optimizer.step()
-
-                # Step scheduler after optimizer (only when actually stepping)
-                if accelerator.sync_gradients:
-                    lr_scheduler.step()
-
+                lr_scheduler.step()
                 optimizer.zero_grad()
 
             # Accumulate loss
