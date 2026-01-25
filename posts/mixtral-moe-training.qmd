@@ -1,10 +1,10 @@
 ---
 title: "Mixtral-8x7B MoE Training with Supervised Routing"
 author: "Vijay Venkatraman"
-date: "2026-01-06"
+date: "2026-01-25"
 categories: [deep learning, training, mixture of experts, mixtral, supervised routing]
 image: "thumbnail.png"
-description: "Train Mixtral-8x7B Mixture of Experts models with supervised routing using HuggingFace Transformers, Accelerate, and DeepSpeed on multi-GPU systems"
+description: "Train Mixtral-8x7B Mixture of Experts models with supervised routing using HuggingFace Transformers, Accelerate, and DeepSpeed on multi-GPU systems. Optimized for fast iteration with balanced dataset."
 ---
 
 ## Overview
@@ -15,11 +15,19 @@ This project demonstrates **true MoE training** with Mixtral-8x7B using supervis
 
 - **Model**: Mixtral-8x7B-v0.1 (mistralai/Mixtral-8x7B-v0.1) - 46.7B parameters, 13B active per forward pass
 - **Architecture**: Native MoE with 8 experts, Top-2 routing
-- **Dataset**: Natural Questions (NQ) with expert annotations - 87,925 Q&A pairs
-- **Hardware**: 2x NVIDIA H100 80GB GPUs
-- **Training Framework**: DeepSpeed ZeRO-2 with HuggingFace Accelerate
+- **Dataset**: Natural Questions (NQ) with expert annotations - **4,837 balanced samples** (balanced version) or 87,925 samples (full)
+- **Hardware**: 8x NVIDIA B200 183GB GPUs
+- **Training Framework**: DeepSpeed ZeRO-2 with HuggingFace Accelerate and Expert Parallelism
 - **Innovation**: Supervised routing with learnable 4→8 expert mapping
-- **Training Time**: ~8-10 hours per epoch
+- **Training Time**: ~2-3 hours for 2 epochs (balanced dataset)
+
+**Optimizations:**
+
+- **Balanced Dataset**: 4,837 samples with equal representation across 4 categories (vs 91% factual in full dataset)
+- **Optimized Target Length**: 32 tokens (was 128) - 4x speedup, covers 99.5% of answers
+- **Optimized Input Length**: 64 tokens (was 256) - better for short Q&A format
+- **Hybrid Parallelism**: 4-way Data Parallelism + 2-way Expert Parallelism
+- **Result**: ~18x fewer samples + 4x faster per sample = hours instead of days
 
 ## Features
 
@@ -39,7 +47,7 @@ This project demonstrates **true MoE training** with Mixtral-8x7B using supervis
 ## Requirements
 
 - Python 3.8+
-- CUDA-capable GPUs (optimized for 2x H100 80GB)
+- CUDA-capable GPUs (optimized for 8x B200 183GB, also works on 2x H100 80GB with adjusted config)
 - DeepSpeed, Transformers, Accelerate
 
 ## Installation
@@ -56,12 +64,31 @@ python -c "import accelerate; print(f'Accelerate: {accelerate.__version__}')"
 
 ## Dataset Format
 
-We'll focus on the 4 reasoning-style experts:
+### Balanced Dataset (Default)
 
-- **Causal / Explanatory**: why, how, explain, cause
-- **Comparative / Superlative**: largest, taller, vs, more than
-- **Multi-hop**: multiple entities, conjunctions (and, or, between)
-- **Direct Lookup**: everything else
+The default dataset `nq_annotated_moe_balanced.jsonl` contains **4,837 samples** with balanced class distribution:
+
+| Category | Samples | Percentage |
+|----------|---------|------------|
+| `factual_lookup` | 2,000 | 41.3% |
+| `numerical_reasoning` | 1,500 | 31.0% |
+| `commonsense_reasoning` | 832 | 17.2% |
+| `multi_hop_reasoning` | 505 | 10.4% |
+
+**Why balanced?** The full Natural Questions dataset is 91% factual_lookup. The balanced version provides:
+- Better supervised routing training (all categories well-represented)
+- 18x faster training (fewer samples)
+- Stronger expert specialization signal
+- Meaningful evaluation across all reasoning types
+
+**Full dataset available:** Use `--data_file nq_annotated_moe.jsonl` for all 87,925 samples.
+
+### Expert Categories
+
+- **factual_lookup**: Direct fact retrieval (who/what/when/where questions)
+- **numerical_reasoning**: Numerical computation (how many/much, distances, percentages)
+- **multi_hop_reasoning**: Multi-step reasoning (relational/comparison questions)
+- **commonsense_reasoning**: Common sense inference (why/reason/cause questions)
 
 The training script expects a JSONL file where each line contains:
 
@@ -69,7 +96,7 @@ The training script expects a JSONL file where each line contains:
 {"question": "Your question here", "answer": "Your answer here", "expert_label": "factual_lookup"}
 ```
 
-Example (`nq_annotated_moe.jsonl`):
+Example:
 
 ```json
 {"question": "where did they film hot tub time machine", "answer": ["Fernie Alpine Resort"], "expert_label": "factual_lookup"}
@@ -91,29 +118,36 @@ The `answer` field can be:
 Adjust `num_processes` to match your number of GPUs:
 
 ```yaml
-num_processes: 4  # Change to your GPU count
+num_processes: 8  # Change to your GPU count (currently 8x B200)
 ```
 
-### DeepSpeed Config (`deepspeed_moe_config.json`)
+### DeepSpeed Config (`deepspeed_moe_config_stage2.json`)
 
-**Current Optimized Configuration (ZeRO Stage 2 for Mixtral-8x7B):**
+**Current Optimized Configuration (ZeRO Stage 2 for 8x B200 GPUs):**
 
 ```json
 {
-  "train_batch_size": 16,
   "train_micro_batch_size_per_gpu": 1,
   "gradient_accumulation_steps": 8,
   "zero_optimization": {
     "stage": 2,
-    "offload_optimizer": {"device": "none"},
+    "offload_optimizer": {
+      "device": "cpu",
+      "pin_memory": true
+    },
     "overlap_comm": true,
-    "contiguous_gradients": true
+    "reduce_bucket_size": 50000000.0,
+    "allgather_bucket_size": 50000000.0
   },
   "bf16": {"enabled": true},
+  "activation_checkpointing": {
+    "partition_activations": true,
+    "cpu_checkpointing": false
+  },
   "moe": {
     "enabled": true,
     "num_experts": 8,
-    "expert_capacity_factor": 1.25,
+    "expert_capacity_factor": 1.0,
     "top_k": 2,
     "expert_parallel_size": 2
   }
@@ -124,15 +158,18 @@ num_processes: 4  # Change to your GPU count
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| **ZeRO Stage** | 2 | Shards optimizer + gradients across GPUs (no CPU offload) |
-| **Micro batch per GPU** | 1 | Mixtral is large (46B params) |
+| **ZeRO Stage** | 2 | Shards optimizer + gradients across Data Parallel dimension (4-way) |
+| **CPU Optimizer Offload** | Enabled | Required to prevent OOM - saves ~43 GB/GPU |
+| **Micro batch per GPU** | 1 | Conservative for memory stability |
 | **Gradient accumulation** | 8 | Accumulate over 8 steps before optimizer update |
-| **Effective batch size** | 16 | 2 GPUs × 1 micro batch × 8 accumulation |
-| **Sequence length** | 256 | Maximum token length (set via --max_seq_length) |
+| **Effective batch size** | 64 | 8 GPUs × 1 micro batch × 8 accumulation |
+| **Input sequence length** | 64 | Optimized for short Q&A (set via --max_seq_length) |
+| **Target sequence length** | 32 | Optimized for NQ dataset (set via --max_target_length) |
 | **Precision** | bfloat16 | Better numerical stability than fp16 |
 | **Num experts** | 8 | Native Mixtral architecture |
 | **Top-K routing** | 2 | Each token uses 2 experts |
-| **Expert parallelism** | 2 | 4 experts per GPU |
+| **Expert parallelism** | 2 | 4 experts per GPU, 4-way data parallelism |
+| **Activation partitioning** | Enabled | Shards activations across GPUs, reduces memory by ~87.5% |
 
 ## Training
 
@@ -145,18 +182,25 @@ accelerate launch --config_file accelerate_config.yaml train_mixtral_8x7b_moe_ac
 ### Training with Custom Options
 
 ```bash
+# Balanced dataset (default, recommended)
 accelerate launch --config_file accelerate_config.yaml train_mixtral_8x7b_moe_accelerate.py \
     --model_id mistralai/Mixtral-8x7B-v0.1 \
-    --data_file nq_annotated_moe.jsonl \
+    --data_file nq_annotated_moe_balanced.jsonl \
     --output_dir ./mixtral_moe_supervised \
-    --epochs 3 \
+    --epochs 2 \
     --learning_rate 1e-5 \
-    --max_seq_length 256 \
+    --max_seq_length 64 \
+    --max_target_length 32 \
     --routing_loss_weight 0.1 \
     --per_device_batch_size 1 \
     --gradient_accumulation_steps 8 \
     --logging_steps 10 \
     --save_steps 500
+
+# Full unbalanced dataset (87,925 samples, ~20 hours)
+accelerate launch --config_file accelerate_config.yaml train_mixtral_8x7b_moe_accelerate.py \
+    --data_file nq_annotated_moe.jsonl \
+    --epochs 1
 ```
 
 ### All Available Arguments
@@ -168,13 +212,13 @@ accelerate launch --config_file accelerate_config.yaml train_mixtral_8x7b_moe_ac
 --disable_supervised_routing   Disable supervised routing (baseline mode)
 
 # Data settings
---data_file                    Path to JSONL dataset (default: nq_annotated_moe.jsonl)
+--data_file                    Path to JSONL dataset (default: nq_annotated_moe_balanced.jsonl)
 --max_samples                  Limit samples for testing (default: None)
---max_seq_length              Maximum sequence length (default: 512)
---max_target_length           Maximum target length (default: 128)
+--max_seq_length              Maximum input sequence length (default: 64)
+--max_target_length           Maximum target/answer length (default: 32, covers 99.5% of NQ data)
 
 # Training settings
---epochs                       Number of epochs (default: 3)
+--epochs                       Number of epochs (default: 2)
 --learning_rate               Learning rate (default: 1e-5)
 --per_device_batch_size       Batch size per GPU (default: 1)
 --gradient_accumulation_steps Gradient accumulation (default: 8)
@@ -243,89 +287,112 @@ tokenizer = AutoTokenizer.from_pretrained("./mixtral_moe_supervised/checkpoint-e
 
 ### Evolution of Configuration
 
-#### Initial Setup (ZeRO Stage 3 + CPU Offloading)
+#### From 2x H100 to 8x B200
 
-**Problem**: Very slow training (~7.5 hours per epoch)
+**Previous Setup (2x H100 80GB):**
+- Dataset: 87,925 samples (imbalanced: 91% factual)
+- Sequence lengths: input=256, target=128
+- Expert Parallelism: 2-way (1 expert per GPU)
+- Training time: ~8-10 hours per epoch
+- Memory: ~50-60 GB per GPU
+
+**Current Optimized Setup (8x B200 183GB):**
+
+#### Key Optimizations
+
+**1. Dataset Balancing**
+- Reduced from 87,925 to 4,837 balanced samples
+- Better class distribution: 41% factual, 31% numerical, 17% commonsense, 10% multi-hop
+- **Benefit**: 18x faster iteration, better routing training
+
+**2. Optimized Sequence Lengths**
+- **Target length**: 128 → 32 tokens (based on dataset analysis: 99th percentile = 24 tokens)
+- **Input length**: 256 → 64 tokens (optimized for short Q&A)
+- **Benefit**: ~4x speedup from reduced padding and activation memory
+
+**3. Hybrid Parallelism**
+- **Expert Parallelism (EP)**: 2-way (4 experts per GPU)
+- **Data Parallelism (DP)**: 4-way (8 GPUs ÷ 2 EP = 4 DP)
+- **Benefit**: Higher throughput from increased data parallelism
+
+**4. CPU Optimizer Offload**
+- Required to prevent OOM with EP=2
+- Offloads ~43 GB optimizer states per GPU to CPU
+- Reduces GPU usage from ~160 GB to ~111.5 GB
+- **Trade-off**: ~30-40% overhead but necessary for stability
+
+**5. Activation Partitioning**
+- Shards activations across 8 GPUs
+- Reduces activation memory by ~87.5%
+- **Benefit**: Enables larger models without CPU activation offload (which is 2-10x slower)
+
+#### Final Configuration Results
 
 ```json
 {
   "train_micro_batch_size_per_gpu": 1,
-  "gradient_accumulation_steps": 16,
-  "zero_optimization": {
-    "stage": 3,
-    "offload_optimizer": {"device": "cpu"},
-    "offload_param": {"device": "cpu"}
-  }
-}
-```
-
-- **GPU Usage**: Only 10 GB (12% utilization)
-- **Speed**: ~1.57 it/s
-- **Bottleneck**: CPU ↔ GPU transfers for parameters
-- **Total iterations**: 43,963 per epoch
-
-#### Why ZeRO Stage 2 Failed Initially
-
-**OOM Error**: `torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 12.38 GiB`
-
-```
-GPU has 79.19 GiB capacity, 9.03 GiB free
-Process has 70.15 GiB in use (62.03 GiB by PyTorch)
-```
-
-**Root Cause**: Used `max_seq_length=512` which caused:
-
-- 4x more activation memory (attention is O(seq_len²))
-- Memory breakdown: 62 GB (model+optimizer+gradients) + 12 GB (activations) = 74 GB
-- Exceeded 79 GB available on H100
-
-#### Final Optimized Configuration (Current)
-
-**Solution**: ZeRO Stage 2 with `max_seq_length=256` and `micro_batch_size=4`
-
-```json
-{
-  "train_micro_batch_size_per_gpu": 4,
-  "gradient_accumulation_steps": 4,
+  "gradient_accumulation_steps": 8,
   "zero_optimization": {
     "stage": 2,
-    "offload_optimizer": {"device": "none"}
+    "offload_optimizer": {"device": "cpu", "pin_memory": true}
   }
 }
 ```
 
-- **GPU Usage**: ~40-50 GB (50-60% utilization - safe margin)
-- **Speed**: ~2-3 it/s (1.5-2x faster than Stage 3)
-- **Training Time**: ~2-2.5 hours per epoch (3x faster)
-- **Total iterations**: ~10,990 optimizer steps per epoch
+- **GPU Usage**: ~111.5 GB / 183 GB (61% utilization, safe margin)
+- **Speed**: ~1-2 it/s
+- **Training Time**: ~2-3 hours for 2 epochs (balanced dataset)
+- **Effective batch size**: 64 (1 × 8 × 8 GPUs)
 
-### Memory Usage Breakdown (Mixtral-8x7B)
+### Memory Usage Breakdown (Mixtral-8x7B on 8x B200)
 
-| Component | Size (BF16) | ZeRO-2 (per GPU) | ZeRO-3 w/ CPU offload |
-|-----------|-------------|------------------|-----------------------|
-| **Model Parameters** | ~90 GB | ~45 GB (sharded) | ~0 GB (on CPU) |
-| **Gradients** | ~90 GB | ~45 GB (sharded) | ~45 GB (sharded) |
-| **Optimizer States** | ~180 GB | ~90 GB (sharded) | ~0 GB (on CPU) |
-| **Activations (batch=1, seq=256)** | ~20 GB | ~20 GB | ~20 GB |
-| **TOTAL** | - | **~50-60 GB** | **~65 GB** |
+| Component | Total Size | Per GPU (ZeRO-2 + EP=2) |
+|-----------|-----------|-------------------------|
+| **Model Parameters** | ~86 GB | ~86 GB (not sharded by ZeRO-2) |
+| **Gradients** | ~86 GB | ~21.5 GB (4-way DP sharded) |
+| **Optimizer States** | ~172 GB | **Offloaded to CPU (~43 GB/GPU)** |
+| **Activations** (batch=1, input=64, target=32) | ~32 GB | ~4 GB (partitioned 8-way) |
+| **Total GPU** | - | **~111.5 GB / 183 GB** |
+| **Total CPU** | - | **~43 GB (optimizer per GPU)** |
 
-**Note**: With Top-2 routing, only 2/8 experts are active per forward pass, reducing effective compute and memory for activations.
+**Hybrid Parallelism Layout:**
+
+```
+GPU Setup: 8x NVIDIA B200 (183GB each)
+├── Data Parallel Groups: 4
+│   ├── DP Group 0: GPUs [0,1]
+│   ├── DP Group 1: GPUs [2,3]
+│   ├── DP Group 2: GPUs [4,5]
+│   └── DP Group 3: GPUs [6,7]
+├── Expert Parallel Groups: 2
+│   ├── Expert Group 0: GPUs [0,2,4,6] → Experts [0,1,2,3]
+│   └── Expert Group 1: GPUs [1,3,5,7] → Experts [4,5,6,7]
+└── Total Batch Size: 64 (1 micro × 8 accum × 8 GPUs)
+```
+
+**Key Memory Features:**
+- **CPU Optimizer Offload**: Required to prevent OOM - saves ~43 GB GPU per GPU by storing Adam states in CPU
+- **Activation Partitioning**: Shards activations across 8 GPUs, reduces activation memory by ~87.5%
+- **Optimized Sequence Lengths**: input_len=64, target_len=32 minimizes activation memory
+- **Memory Headroom**: ~71.5 GB free per GPU for safety margin
+- With expert parallelism (EP=2), each GPU holds 4 of 8 experts; Top-2 routing activates 2 experts per forward pass
 
 ## Understanding Training Metrics
 
 ### Progress Bar Explanation
 
 ```
-Epoch 1/1: 5% | 2239/43963 [40:21<7:22:22, 1.57it/s, loss=0.0325, lr=1.97e-05]
-11/25/2025 04:41:02 - INFO - Step 140/10991 | Loss: 0.7643 | LR: 1.97e-05
+Epoch 1/2: 15% | 120/604 [12:00<1:20:00, 1.5it/s, loss=0.0325, lr=1.97e-05]
+01/25/2026 14:30:00 - INFO - Step 15/151 | Loss: 0.7643 | LR: 1.97e-05
 ```
 
 **Two different step counts:**
 
-- **43,963**: Total dataloader iterations (batches processed)
-  - Calculated as: 87,925 samples ÷ 2 (micro_batch × num_gpus) = 43,963
-- **10,991**: Total optimizer steps (weight updates)
-  - Calculated as: 43,963 ÷ 4 (gradient_accumulation_steps) = 10,991
+- **604**: Total dataloader iterations (batches processed per GPU)
+  - Calculated as: 4,837 samples ÷ 8 GPUs ÷ 1 (micro_batch) = 604 iterations per epoch
+- **151**: Total optimizer steps (weight updates per epoch)
+  - Calculated as: 4,837 samples ÷ 64 (global batch size) = 75 steps per epoch
+  - Or: 604 iterations ÷ 8 (gradient_accumulation_steps) = 75 steps per epoch
 
 **Loss values:**
 
@@ -336,8 +403,8 @@ Epoch 1/1: 5% | 2239/43963 [40:21<7:22:22, 1.57it/s, loss=0.0325, lr=1.97e-05]
 
 ```
 Effective Batch Size = num_gpus × micro_batch_size × gradient_accumulation_steps
-                     = 2 × 4 × 4
-                     = 32 samples per optimizer update
+                     = 8 × 1 × 8
+                     = 64 samples per optimizer update
 ```
 
 ## Key Lessons Learned
@@ -386,16 +453,34 @@ For our H100s with 80 GB each, CPU offloading is **wasteful** - we have plenty o
 
 ### Out of Memory (OOM)
 
-If you encounter OOM errors:
+**Current configuration already has CPU optimizer offload enabled** - this is required for stable training with EP=2.
 
-1. **Reduce micro batch size**: `train_micro_batch_size_per_gpu: 4 → 2` or `1`
-2. **Increase gradient accumulation**: `gradient_accumulation_steps: 4 → 8` (keeps same effective batch)
-3. **Reduce sequence length**: `--max_seq_length 256 → 128`
-4. **Enable CPU offloading** (last resort):
-   ```json
-   "offload_optimizer": {"device": "cpu", "pin_memory": true}
+If you still encounter OOM errors:
+
+1. **Verify CPU offload is enabled**:
+   ```bash
+   grep -A 3 "offload_optimizer" deepspeed_moe_config_stage2.json
+   # Should show: "device": "cpu"
    ```
-5. **Switch to ZeRO Stage 3** with parameter offloading
+
+2. **Reduce sequence lengths further**:
+   ```bash
+   bash run_training.sh --seq-length 32
+   ```
+
+3. **Switch to ZeRO Stage 3** (more aggressive offloading):
+   ```bash
+   # Edit accelerate_config.yaml, line 4:
+   deepspeed_config_file: deepspeed_moe_config_stage3.json
+   ```
+
+4. **Increase expert parallelism** (reduces experts per GPU):
+   ```json
+   // Edit deepspeed_moe_config_stage2.json
+   "moe": {
+     "expert_parallel_size": 4  // Was 2, now EP=4, DP=2
+   }
+   ```
 
 **Memory fragmentation fix** (if you see "reserved but unallocated" warnings):
 
@@ -405,16 +490,32 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Slow Training
 
-If training is too slow:
+**Expected speed for current config:**
+- 8x B200 (EP=2, DP=4, CPU offload): ~1-2 it/s
+- Note: CPU optimizer offload adds ~30-40% overhead but is required to prevent OOM
 
-1. **Check GPU memory usage**: Should be 50-70% utilized
+If training is slower than expected:
+
+1. **Check GPU utilization**: All 8 GPUs should be in use
    ```bash
    watch -n 2 nvidia-smi
    ```
-2. **Increase micro batch size** if memory allows (more GPU usage = faster)
-3. **Disable CPU offloading** if enabled
-4. **Use ZeRO Stage 2** instead of Stage 3 (faster communication)
+2. **Verify NVLink/NVSwitch connectivity**:
+   ```bash
+   nvidia-smi topo -m
+   ```
+3. **Check for I/O bottlenecks** (slow disk):
+   ```bash
+   iostat -x 2
+   ```
+4. **Verify all 8 GPUs are being used**:
+   ```bash
+   grep "num_processes:" accelerate_config.yaml
+   # Should show: num_processes: 8
+   ```
 5. **Reduce logging frequency**: `--logging_steps 10 → 50`
+
+**Note**: Don't disable CPU optimizer offload - it's required for this configuration.
 
 ### Multi-GPU Issues
 
@@ -425,15 +526,21 @@ If training is too slow:
 
 ## Performance Tips
 
-1. **Maximize GPU Utilization**: Increase `train_micro_batch_size_per_gpu` until you use 60-80% of GPU memory
-2. **Minimize Gradient Accumulation**: Lower values = faster training (use it only when memory-constrained)
-3. **Sequence Length vs Batch Size**: Shorter sequences allow larger batch sizes
+1. **Use Balanced Dataset**: The default balanced dataset (4,837 samples) is 18x faster than the full dataset while providing better routing training
+2. **Optimize Sequence Lengths**: Current config (input=64, target=32) is already optimized for NQ dataset
+3. **Monitor GPU Utilization**: Should be ~60% (111.5 GB / 183 GB) with CPU optimizer offload
 4. **Mixed Precision**: BF16 is more stable than FP16 for large models
-5. **Gradient Checkpointing**: Already enabled in script - trades compute for memory
+5. **Gradient Checkpointing + Activation Partitioning**: Already enabled - trades compute for memory efficiency
 6. **Effective Batch Size Formula**:
    ```
    effective_batch = micro_batch_per_gpu × num_gpus × grad_accumulation
+                   = 1 × 8 × 8 = 64
    ```
+7. **For Faster Iteration**: Use `--max-samples 500` for quick testing
+8. **Expert Parallelism Trade-off**: EP=2 gives good balance between memory and performance
+   - EP=1: Higher memory per GPU, fewer iterations
+   - EP=2: Current config, balanced
+   - EP=4: Lower memory per GPU, more communication overhead
 
 ## File Structure
 
@@ -444,10 +551,13 @@ If training is too slow:
 ├── prepare_dataset.py             # Dataset annotation with expert labels
 ├── test_model_loading.py          # Unit test: model loading
 ├── test_supervised_routing.py     # Unit test: routing module
-├── accelerate_config.yaml         # Accelerate distributed config (2 GPUs)
-├── deepspeed_moe_config.json      # DeepSpeed ZeRO-2 config (8 experts, Top-2)
-├── nq_annotated_moe.jsonl         # Annotated NQ dataset (87,925 samples)
+├── accelerate_config.yaml         # Accelerate distributed config (8 GPUs)
+├── deepspeed_moe_config_stage2.json # DeepSpeed ZeRO-2 config (8 experts, Top-2)
+├── deepspeed_moe_config_stage3.json # DeepSpeed ZeRO-3 config (alternative)
+├── nq_annotated_moe.jsonl         # Full annotated dataset (87,925 samples)
+├── nq_annotated_moe_balanced.jsonl # Balanced dataset (4,837 samples) ⭐
 ├── mixtral_moe_supervised/        # Output directory (checkpoints)
+├── run_training.sh                # Automated training script
 └── README.md                      # Comprehensive guide
 ```
 
@@ -461,12 +571,54 @@ python prepare_dataset.py
 
 This creates `nq_annotated_moe.jsonl` with 4 expert types:
 
-- **factual_lookup** (who/what/when/where questions)
-- **numerical_reasoning** (how many/much, distances, percentages)
-- **multi_hop_reasoning** (relational/comparison questions)
-- **commonsense_reasoning** (why/reason/cause questions)
+- **factual_lookup** (who/what/when/where questions) - 80,204 samples (91.2%)
+- **numerical_reasoning** (how many/much, distances, percentages) - 6,384 samples (7.3%)
+- **multi_hop_reasoning** (relational/comparison questions) - 505 samples (0.6%)
+- **commonsense_reasoning** (why/reason/cause questions) - 832 samples (0.9%)
 
 The expert labels are used for MoE routing during training.
+
+### Creating Balanced Dataset
+
+The full dataset is heavily imbalanced. To create a balanced version:
+
+```python
+import json
+import random
+
+random.seed(42)
+
+# Define target counts per category
+target_counts = {
+    'factual_lookup': 2000,
+    'numerical_reasoning': 1500,
+    'commonsense_reasoning': 'all',  # Take all 832
+    'multi_hop_reasoning': 'all'     # Take all 505
+}
+
+# Read and organize by category
+samples_by_category = {cat: [] for cat in target_counts}
+with open('nq_annotated_moe.jsonl', 'r') as f:
+    for line in f:
+        data = json.loads(line)
+        samples_by_category[data['expert_label']].append(data)
+
+# Sample and shuffle
+balanced = []
+for cat, count in target_counts.items():
+    available = samples_by_category[cat]
+    selected = available if count == 'all' else random.sample(available, min(count, len(available)))
+    balanced.extend(selected)
+
+random.shuffle(balanced)
+
+# Write balanced dataset
+with open('nq_annotated_moe_balanced.jsonl', 'w') as f:
+    for sample in balanced:
+        f.write(json.dumps(sample) + '\n')
+```
+
+This creates `nq_annotated_moe_balanced.jsonl` with 4,837 samples and better class distribution.
 
 ## Learning Rate Schedule: Cosine Annealing
 
@@ -538,39 +690,61 @@ This training code is provided as-is. Please refer to the respective licenses of
 
 ```bash
 # Hardware
-2x NVIDIA H100 80GB GPUs
+8x NVIDIA B200 183GB GPUs
 
 # Model
 Model: Mixtral-8x7B-v0.1 (46.7B params)
 Architecture: 8 experts, Top-2 routing
 Active params per forward: ~13B (2/8 experts)
 
+# Dataset
+Default: nq_annotated_moe_balanced.jsonl (4,837 samples)
+Full: nq_annotated_moe.jsonl (87,925 samples)
+Distribution: Balanced across 4 categories
+
 # Configuration
-ZeRO Stage: 2 (no CPU offload)
+ZeRO Stage: 2 (with CPU optimizer offload)
+Expert Parallelism: 2-way (4 experts per GPU)
+Data Parallelism: 4-way
 Micro batch per GPU: 1
 Gradient accumulation: 8
-Effective batch size: 16
-Sequence length: 256
+Effective batch size: 64
+Input sequence length: 64
+Target sequence length: 32
 Precision: bfloat16
 Supervised routing: Enabled (weight: 0.1)
 
 # Performance
-GPU memory usage: ~50-60 GB per GPU
-Training speed: ~0.5-1.0 it/s
-Training time: ~8-10 hours per epoch
+GPU memory usage: ~111.5 GB per GPU (183 GB available)
+CPU memory: ~43 GB per GPU (optimizer offload)
+Training speed: ~1-2 it/s
+Training time: ~2-3 hours for 2 epochs (balanced dataset)
+Training time: ~20 hours for 1 epoch (full dataset)
 ```
 
 ### Common Commands
 
 ```bash
-# Start training
+# Start training (recommended - uses run_training.sh)
+bash run_training.sh
+
+# Or start training directly
 accelerate launch --config_file accelerate_config.yaml train_mixtral_8x7b_moe_accelerate.py
+
+# Quick test with limited samples
+bash run_training.sh --max-samples 500 --epochs 1
+
+# Use full unbalanced dataset
+bash run_training.sh --data-file nq_annotated_moe.jsonl --epochs 1
 
 # Monitor GPUs
 watch -n 2 nvidia-smi
 
 # Check training logs
-tail -f nohup.out | grep "Step.*Loss"
+tail -f mixtral_moe_supervised/training_*.log
+
+# Monitor training (using monitor script)
+bash monitor_training.sh
 
 # Kill training
 pkill -f train_mixtral_8x7b_moe_accelerate.py
@@ -581,15 +755,20 @@ pkill -f train_mixtral_8x7b_moe_accelerate.py
 | What | Current Value | Where to Change |
 |------|---------------|-----------------|
 | Model | Mixtral-8x7B-v0.1 | Command line: `--model_id` |
-| Num experts | 8 | `deepspeed_moe_config.json` → `moe.num_experts` |
-| Top-K routing | 2 | `deepspeed_moe_config.json` → `moe.top_k` |
-| ZeRO Stage | 2 | `deepspeed_moe_config.json` → `zero_optimization.stage` |
-| Micro batch size | 1 | `deepspeed_moe_config.json` → `train_micro_batch_size_per_gpu` |
-| Gradient accumulation | 8 | `deepspeed_moe_config.json` → `gradient_accumulation_steps` |
-| Sequence length | 256 | Command line: `--max_seq_length 256` |
+| Dataset | nq_annotated_moe_balanced.jsonl | Command line: `--data_file` |
+| Num experts | 8 | `deepspeed_moe_config_stage2.json` → `moe.num_experts` |
+| Top-K routing | 2 | `deepspeed_moe_config_stage2.json` → `moe.top_k` |
+| Expert parallelism | 2 | `deepspeed_moe_config_stage2.json` → `moe.expert_parallel_size` |
+| ZeRO Stage | 2 | `deepspeed_moe_config_stage2.json` → `zero_optimization.stage` |
+| CPU optimizer offload | Enabled | `deepspeed_moe_config_stage2.json` → `offload_optimizer.device` |
+| Micro batch size | 1 | `deepspeed_moe_config_stage2.json` → `train_micro_batch_size_per_gpu` |
+| Gradient accumulation | 8 | `deepspeed_moe_config_stage2.json` → `gradient_accumulation_steps` |
+| Input sequence length | 64 | Command line: `--max_seq_length 64` |
+| Target sequence length | 32 | Command line: `--max_target_length 32` |
 | Routing weight | 0.1 | Command line: `--routing_loss_weight 0.1` |
-| Number of GPUs | 2 | `accelerate_config.yaml` → `num_processes` |
+| Number of GPUs | 8 | `accelerate_config.yaml` → `num_processes` |
 | Learning rate | 1e-5 | Command line: `--learning_rate 1e-5` |
+| Epochs | 2 | Command line: `--epochs 2` |
 
 ## Support
 

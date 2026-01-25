@@ -100,8 +100,8 @@ def parse_args():
     parser.add_argument(
         "--max_target_length",
         type=int,
-        default=128,
-        help="Maximum length for target/answer"
+        default=32,
+        help="Maximum length for target/answer (dataset 99th percentile: 24 tokens)"
     )
     parser.add_argument(
         "--learning_rate",
